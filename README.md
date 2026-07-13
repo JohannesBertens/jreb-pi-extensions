@@ -14,7 +14,7 @@ Colorful statusline showing token usage, context window progress, git branch, an
 - **● branch** — current git branch
 - **model** — active model name
 
-![footer example](https://i.imgur.com/placeholder.png)
+![footer example](./images/footer.png)
 
 ## Installation
 
