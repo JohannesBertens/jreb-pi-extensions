@@ -7,6 +7,10 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execSync } from "child_process";
 
+// Shared state accessible from pi-level event handlers
+let currentTui: any = null;
+let dirtyState: boolean | null = null;
+
 function checkGitDirty(cwd: string): boolean {
     try {
         const output = execSync("git status --porcelain", { cwd, encoding: "utf-8", timeout: 3000 });
@@ -16,43 +20,31 @@ function checkGitDirty(cwd: string): boolean {
     }
 }
 
-function buildFooter(ctx: ExtensionCommandContext) {
-    // null = stale, need to re-check; true = dirty; false = clean
-    let dirty: boolean | null = null;
+function requestFooterRender() {
+    if (dirtyState === null) {
+        dirtyState = checkGitDirty(currentTui?.session?.cwd || ".");
+    }
+    currentTui?.requestRender();
+}
 
+function buildFooter(ctx: ExtensionCommandContext) {
     return (tui: any, theme: any, footerData: any) => {
-        // Re-check git dirty on file/branch changes and tool execution
-        const onBranch = footerData.onBranchChange(() => {
-            dirty = null;
+        currentTui = tui;
+        if (dirtyState === null) {
+            dirtyState = checkGitDirty(ctx.cwd || ".");
+        }
+
+        const unsubBranch = footerData.onBranchChange(() => {
+            dirtyState = null;
             tui.requestRender();
         });
 
-        const onToolResult = (_event: any) => {
-            dirty = null;
-            tui.requestRender();
-        };
-        const onUserBash = (_event: any) => {
-            dirty = null;
-            tui.requestRender();
-        };
-        ctx.on("tool_result", onToolResult);
-        ctx.on("user_bash", onUserBash);
-
-        const dispose = () => {
-            onBranch();
-            ctx.off("tool_result", onToolResult);
-            ctx.off("user_bash", onUserBash);
-        };
-
         return {
-            dispose,
+            dispose() {
+                unsubBranch();
+            },
             invalidate() {},
             render(width: number): string[] {
-                // Re-check dirty status if stale
-                if (dirty === null) {
-                    dirty = checkGitDirty(ctx.cwd || ".");
-                }
-
                 let input = 0, output = 0, totalTokens = 0;
                 for (const e of ctx.sessionManager.getBranch()) {
                     if (e.type === "message" && e.message.role === "assistant") {
@@ -91,8 +83,8 @@ function buildFooter(ctx: ExtensionCommandContext) {
                 const folderName = cwd.split("/").filter(Boolean).pop() || cwd;
                 const folderStr = " " + theme.fg("syntaxKeyword", folderName) + "";
                 const branch = footerData.getGitBranch();
-                const gitSymbol = dirty ? "±" : "●";
-                const gitColor = dirty ? "error" : "accent";
+                const gitSymbol = dirtyState ? "±" : "●";
+                const gitColor = dirtyState ? "error" : "accent";
                 const branchStr = branch ? " " + theme.fg(gitColor, `[${gitSymbol} ${branch}]`) : "";
                 const left = `${folderStr}${branchStr}`;
 
@@ -112,6 +104,10 @@ function buildFooter(ctx: ExtensionCommandContext) {
 
 export default function (pi: ExtensionAPI) {
     let enabled = true;  // enabled by default
+
+    // Listen at pi level to invalidate dirty cache after file/branch changes and tool execution
+    pi.on("tool_result", requestFooterRender);
+    pi.on("user_bash", requestFooterRender);
 
     // Enable footer on every session start
     pi.on("session_start", async (_event, ctx) => {
