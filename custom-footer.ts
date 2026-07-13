@@ -17,26 +17,40 @@ function checkGitDirty(cwd: string): boolean {
 }
 
 function buildFooter(ctx: ExtensionCommandContext) {
-    // Cached dirty state — refreshed on branch change and periodically
-    let dirty = false;
-    let lastDirtyCheck = 0;
-    const dirtyCheckInterval = 5000; // ms
+    // null = stale, need to re-check; true = dirty; false = clean
+    let dirty: boolean | null = null;
 
     return (tui: any, theme: any, footerData: any) => {
-        const unsub = footerData.onBranchChange(() => {
-            dirty = checkGitDirty(ctx.cwd || ".");
+        // Re-check git dirty on file/branch changes and tool execution
+        const onBranch = footerData.onBranchChange(() => {
+            dirty = null;
             tui.requestRender();
         });
 
+        const onToolResult = (_event: any) => {
+            dirty = null;
+            tui.requestRender();
+        };
+        const onUserBash = (_event: any) => {
+            dirty = null;
+            tui.requestRender();
+        };
+        ctx.on("tool_result", onToolResult);
+        ctx.on("user_bash", onUserBash);
+
+        const dispose = () => {
+            onBranch();
+            ctx.off("tool_result", onToolResult);
+            ctx.off("user_bash", onUserBash);
+        };
+
         return {
-            dispose: unsub,
+            dispose,
             invalidate() {},
             render(width: number): string[] {
-                // Refresh dirty status periodically
-                const now = Date.now();
-                if (now - lastDirtyCheck > dirtyCheckInterval) {
+                // Re-check dirty status if stale
+                if (dirty === null) {
                     dirty = checkGitDirty(ctx.cwd || ".");
-                    lastDirtyCheck = now;
                 }
 
                 let input = 0, output = 0, totalTokens = 0;
