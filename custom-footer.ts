@@ -85,7 +85,7 @@ function buildFooter(ctx: ExtensionCommandContext) {
                 // Right: token stats + context bar + model name
                 const model = ctx.model?.id || "no-model";
                 const modelStr = theme.fg("syntaxType", model);
-                const right = `${arrowIn} ${inputStr} ${arrowOut} ${outputStr}${sep}${contextBar}${modelStr}`;
+                const right = `${arrowIn} ${inputStr} ${arrowOut} ${outputStr}${contextBar} ${modelStr}`;
 
                 const totalContentWidth = visibleWidth(left) + visibleWidth(right);
                 const pad = " ".repeat(Math.max(1, width - totalContentWidth));
