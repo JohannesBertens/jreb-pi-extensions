@@ -5,59 +5,41 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { execSync } from "child_process";
+import { execSync } from "node:child_process";
 
-// Shared state accessible from pi-level event handlers
-let currentTui: any = null;
-let dirtyState: boolean | null = null;
-
-function checkGitDirty(cwd: string): boolean {
+function getGitStatus(cwd: string): { branch: string | undefined; dirty: boolean } {
     try {
-        const output = execSync("git status --porcelain", { cwd, encoding: "utf-8", timeout: 3000 });
-        return output.trim().length > 0;
+        const branch = execSync("git branch --show-current", { cwd, encoding: "utf-8", timeout: 3000 }).trim();
+        const dirty = execSync("git status --porcelain", { cwd, encoding: "utf-8", timeout: 3000 }).trim().length > 0;
+        return { branch: branch || undefined, dirty };
     } catch {
-        return false;
+        return { branch: undefined, dirty: false };
     }
-}
-
-function requestFooterRender() {
-    if (dirtyState === null) {
-        dirtyState = checkGitDirty(currentTui?.session?.cwd || ".");
-    }
-    currentTui?.requestRender();
 }
 
 function buildFooter(ctx: ExtensionCommandContext) {
     return (tui: any, theme: any, footerData: any) => {
-        currentTui = tui;
-        if (dirtyState === null) {
-            dirtyState = checkGitDirty(ctx.cwd || ".");
-        }
-
-        const unsubBranch = footerData.onBranchChange(() => {
-            dirtyState = null;
-            tui.requestRender();
-        });
+        const unsubBranch = footerData.onBranchChange(() => tui.requestRender());
 
         return {
             dispose() {
                 unsubBranch();
             },
-            invalidate() {},
             render(width: number): string[] {
-                let input = 0, output = 0, totalTokens = 0;
+                // Token usage from session history
+                let input = 0, output = 0;
                 for (const e of ctx.sessionManager.getBranch()) {
                     if (e.type === "message" && e.message.role === "assistant") {
                         const m = e.message as AssistantMessage;
                         input += m.usage.input;
                         output += m.usage.output;
-                        totalTokens += m.usage.input + m.usage.output;
                     }
                 }
 
                 const fmt = (n: number) => (n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`);
 
-                // Context size bar
+                // Context window progress bar
+                const totalTokens = input + output;
                 const maxContext = ctx.model?.contextWindow || 0;
                 let contextBar = "";
                 if (maxContext > 0) {
@@ -66,9 +48,9 @@ function buildFooter(ctx: ExtensionCommandContext) {
                     const filled = Math.round(pct * barLen);
                     const empty = barLen - filled;
                     const barColor = pct > 0.9 ? "error" : pct > 0.7 ? "warning" : "success";
-                    contextBar = " " + theme.fg("dim", "[") + theme.fg(barColor, "█".repeat(filled)) + theme.fg("dim", "░".repeat(empty)) + theme.fg("dim", "]") + " " + theme.fg("dim", fmt(totalTokens) + "/" + fmt(maxContext));
+                    contextBar = ` ${theme.fg("dim", "[")}${theme.fg(barColor, "█".repeat(filled))}${theme.fg("dim", "░".repeat(empty))}${theme.fg("dim", "]")} ${theme.fg("dim", fmt(totalTokens) + "/" + fmt(maxContext))}`;
                 } else {
-                    contextBar = " " + theme.fg("dim", "ctx: " + fmt(totalTokens));
+                    contextBar = ` ${theme.fg("dim", "ctx: " + fmt(totalTokens))}`;
                 }
 
                 // Colored segments
@@ -76,16 +58,14 @@ function buildFooter(ctx: ExtensionCommandContext) {
                 const arrowOut = theme.fg("toolDiffRemoved", "↓");
                 const inputStr = theme.fg("syntaxString", fmt(input));
                 const outputStr = theme.fg("syntaxNumber", fmt(output));
-                const sep = theme.fg("borderMuted", "│");
 
                 // Left: current folder + git branch
-                const cwd = ctx.cwd || ".";
-                const folderName = cwd.split("/").filter(Boolean).pop() || cwd;
-                const folderStr = " " + theme.fg("syntaxKeyword", folderName) + "";
-                const branch = footerData.getGitBranch();
-                const gitSymbol = dirtyState ? "±" : "●";
-                const gitColor = dirtyState ? "error" : "accent";
-                const branchStr = branch ? " " + theme.fg(gitColor, `[${gitSymbol} ${branch}]`) : "";
+                const folderName = ctx.cwd.split("/").filter(Boolean).pop() || ctx.cwd;
+                const folderStr = ` ${theme.fg("syntaxKeyword", folderName)}`;
+                const git = getGitStatus(ctx.cwd);
+                const gitSymbol = git.dirty ? "±" : "●";
+                const gitColor = git.dirty ? "error" : "accent";
+                const branchStr = git.branch ? ` ${theme.fg(gitColor, `[${gitSymbol} ${git.branch}]`)}` : "";
                 const left = `${folderStr}${branchStr}`;
 
                 // Right: token stats + context bar + model name
@@ -103,11 +83,7 @@ function buildFooter(ctx: ExtensionCommandContext) {
 }
 
 export default function (pi: ExtensionAPI) {
-    let enabled = true;  // enabled by default
-
-    // Listen at pi level to invalidate dirty cache after file/branch changes and tool execution
-    pi.on("tool_result", requestFooterRender);
-    pi.on("user_bash", requestFooterRender);
+    let enabled = true;
 
     // Enable footer on every session start
     pi.on("session_start", async (_event, ctx) => {
@@ -116,7 +92,7 @@ export default function (pi: ExtensionAPI) {
         }
     });
 
-    // Keep /footer as toggle
+    // Toggle command
     pi.registerCommand("footer", {
         description: "Toggle custom colorful footer",
         handler: async (_args, ctx) => {
