@@ -18,6 +18,14 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 ## Installation
 
+### Option 0: One-liner (install or update from GitHub)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JohannesBertens/jreb-pi-extensions/main/install.sh | sh
+```
+
+Overwrites the extension files in `~/.pi/agent/extensions/`, so re-running it updates to the latest version. Set `PI_EXTENSIONS_DIR` to target a different folder.
+
 ### Option 1: Copy to pi extensions folder
 
 ```bash
