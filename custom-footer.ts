@@ -8,9 +8,12 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { execSync } from "node:child_process";
 
 function getGitStatus(cwd: string): { branch: string | undefined; dirty: boolean } {
+    // stdio must be explicit: execSync's default lets git's stderr leak to the
+    // terminal (e.g. "fatal: not a git repository") even when we catch the error.
+    const opts = { cwd, encoding: "utf-8" as const, timeout: 3000, stdio: ["ignore", "pipe", "pipe"] as const };
     try {
-        const branch = execSync("git branch --show-current", { cwd, encoding: "utf-8", timeout: 3000 }).trim();
-        const dirty = execSync("git status --porcelain", { cwd, encoding: "utf-8", timeout: 3000 }).trim().length > 0;
+        const branch = execSync("git branch --show-current", opts).trim();
+        const dirty = execSync("git status --porcelain", opts).trim().length > 0;
         return { branch: branch || undefined, dirty };
     } catch {
         return { branch: undefined, dirty: false };
