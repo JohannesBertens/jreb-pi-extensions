@@ -1,2 +1,5 @@
 node_modules/
 *.tsbuildinfo
+# pi-coding-agent subagent scratch dir
+.pi-subagents/
+
