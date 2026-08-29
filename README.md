@@ -18,11 +18,19 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 ### Herdr Telegram Ask (`herdr-telegram-ask.ts`)
 
-For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Telegram** — or at the terminal, whichever answers first. When a question opens you get a rich message (questions with numbered options, host/project/session); tapping an option or replying with text answers it remotely (`✅ answered via Telegram`), answering at the terminal edits the message to `⌨️ answered at the terminal`. Inert unless pi runs under Herdr (`HERDR_ENV=1`).
+**Answer pi's `ask_user_question` from Telegram** — or at the terminal, whichever answers first. When a question opens you get a rich message (questions with numbered options, host/project/session); tapping an option or replying with text answers it remotely (`✅ answered via Telegram`), answering at the terminal edits the message to `⌨️ answered at the terminal`.
 
-**How it works:** pi's `ask_user_question` is itself an extension ([`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono)); this extension registers a same-name tool with a byte-compatible contract that races the Telegram wizard against a local dialog. If Telegram is unreachable, it degrades to local-only answering. ADR with the full rationale: see the repo memory notes.
+**This file is the provider-of-record for `ask_user_question`** (ADR-0002): it registers the tool unconditionally on load, everywhere — no Herdr required. Without a Telegram config (or after `/telegram off`) it is simply the local questionnaire, byte-compatible with the upstream tool. If you previously installed the npm package `@juicesharp/rpiv-ask-user-question`, **remove it** (`pi remove npm:@juicesharp/rpiv-ask-user-question`) — alongside this file it can only produce a duplicate-tool warning banner and lose.
 
-**Setup** (one-time, under Herdr):
+**How it works:** the tool contract is a frozen, byte-compatible clone of [`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono) `2.7.1`; the handler races the Telegram wizard against a local dialog. If Telegram is unreachable, it degrades to local-only answering. ADR with the full rationale: see the repo memory notes.
+
+> **⚠️ Drift duty — check upstream periodically.** The clone is frozen at rpiv `2.7.1` and upstream is not installed, so nothing warns you automatically. Run
+> ```sh
+> npm view @juicesharp/rpiv-ask-user-question version
+> ```
+> occasionally (e.g. after a `pi update` or once a month). If it is newer than `CLONED_RPIV_VERSION` in the source, re-diff the clone (input schema, runtime validation, response envelope, description/snippet/guidelines) and bump the constant. `/telegram status` prints the current provenance and this reminder.
+
+**Setup** (one-time; Telegram answering works with or without Herdr):
 1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
 2. In pi: `/telegram setup` — paste the token, then send `/start` to your bot in Telegram. The chat is discovered automatically; config is saved to `~/.pi/agent/herdr-telegram.json` (0600).
 
@@ -30,8 +38,8 @@ For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Tel
 
 - Only the configured chat may answer; every other chat is ignored. Free-text replies become custom answers ("Type something." row). multiSelect questions get toggle buttons + `✅ Submit`.
 - While a question is open, the message refreshes its `⏳ waiting` line once a minute (stops after 30 min).
-- `/telegram status` also shows the installed rpiv version vs. the contract this extension clones (`2.7.1`) — if they diverge after a `pi update`, re-diff the clone (ADR-0001).
-- `/telegram off` disables remote answering and notifications; run `/reload` afterwards to fully restore the original rpiv tool (until then it falls back to local-only dialogs).
+- `/telegram status` shows the upstream-vs-clone drift hint (see **Drift duty** above) plus config/tool state.
+- `/telegram off` disables remote answering immediately — the tool stays registered and serves local-only dialogs from the next question on. No `/reload` needed.
 
 **Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).
 
@@ -47,8 +55,8 @@ For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Tel
 6. **Multi-question wizard** — a 2+ question ask walks the phone through questions one at a time (progress lines above the keyboard).
 7. **Concurrent sessions** — open questions in two pi processes at once → both remain locally answerable; one process's polling backs off (Telegram `409`) — phone answering may be briefly slow, never blocked.
 8. **Network loss** — go offline mid-question → terminal answering unaffected; the open Telegram message simply never gets its ✅ edit, and later taps on it spin out (polling already stopped) — expected.
-9. **Herdr readout** — while a question is open, the Herdr pane shows red/blocked (the sibling `herdr-blocked-on-question` extension keeps working through the shadow).
-10. **Sanity** — `/telegram status` shows `tool: shadowed`; `/telegram test` send+edit round-trips.
+9. **Herdr readout** — while a question is open, the Herdr pane shows red/blocked (the sibling `herdr-blocked-on-question` extension tracks the tool by name and keeps working).
+10. **Sanity** — `/telegram status` shows `tool: ask_user_question owned by this file`; `/telegram test` send+edit round-trips.
 
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 

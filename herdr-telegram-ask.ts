@@ -1,14 +1,20 @@
 /**
- * herdr-telegram-ask — Telegram companion for pi's `ask_user_question`.
+ * herdr-telegram-ask — Telegram companion AND provider-of-record for pi's
+ * `ask_user_question` tool (ADR-0002).
  *
- * M1 (this file, notify layer): while pi has an `ask_user_question` open, send a
- * rich Telegram message (questions, options, session context) and edit it to ✅
- * (with the answer) when the question resolves. Two-way answering (same-name
- * tool shadow, buttons, races) is M2 — see jreb-memory plans/herdr-telegram-ask.md.
+ * This file owns the tool outright: it registers `ask_user_question`
+ * unconditionally at load — a byte-compatible clone of the contract from the
+ * npm package @juicesharp/rpiv-ask-user-question 2.7.1. That package must NOT
+ * be installed alongside this file (pi flags the duplicate tool name; the
+ * package would only conflict and lose). The handler races a Telegram
+ * inline-keyboard wizard against the local terminal — first definitive answer
+ * wins. Without a Telegram config (or after `/telegram off`) it degrades to
+ * local-only, which behaves exactly like the upstream tool.
  *
- * Gating: inert unless pi runs under Herdr (`HERDR_ENV=1`), exactly like the
- * sibling `herdr-blocked-on-question.ts`. Within that, `/telegram setup` creates
- * the config; the notifier only fires when config exists and is enabled.
+ * Drift duty (ADR-0002): the clone is frozen at rpiv 2.7.1. Check
+ * `npm view @juicesharp/rpiv-ask-user-question version` periodically; on a
+ * newer release, re-diff the clone (schema/validator/envelope/meta) and bump
+ * CLONED_RPIV_VERSION.
  *
  * Zero runtime dependencies: Node's global fetch only, and every network path is
  * funneled through an injectable Transport so scripts/smoke-telegram.mts can run
@@ -184,22 +190,12 @@ function oneLine(text: string, max: number): string {
     return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
 }
 
-/** The ✅-edit summary: first text block of the tool result (rpiv's answer envelope). */
-export function resolveAnswerSummary(result: unknown): string | undefined {
-    const content = (result as { content?: Array<{ type?: string; text?: unknown }> } | undefined)?.content;
-    const text = Array.isArray(content) ? content[0]?.text : undefined;
-    if (typeof text !== "string" || text.length === 0) return undefined;
-    return oneLine(text, 180);
-}
-
 export interface RenderInput {
     args: QuestionnaireArgs;
     host: string;
     project: string;
     sessionName?: string;
     now?: Date;
-    /** interactive = buttons present (shadow tool); notify = plain alert (fallback layer). */
-    mode?: "interactive" | "notify";
 }
 
 export function renderQuestionnaireMessage(input: RenderInput): string {
@@ -236,9 +232,7 @@ export function renderQuestionnaireMessage(input: RenderInput): string {
     // Budget: truncate question bodies from the middle if over the Telegram limit.
     const tail =
         `\n${hasPreview ? "<i>(option previews not shown here)</i>\n" : ""}` +
-        (input.mode === "interactive"
-            ? "Tap an option or reply with text — or answer at the terminal."
-            : "Answer at the terminal (remote answering unavailable).");
+        "Tap an option or reply with text — or answer at the terminal.";
     while (head.length + body.join("\n").length + tail.length > MAX_MESSAGE_CHARS && body.length > 1) {
         const mid = Math.floor(body.length / 2);
         body.splice(mid, 1);
@@ -250,119 +244,12 @@ export function renderQuestionnaireMessage(input: RenderInput): string {
 }
 
 // ---------------------------------------------------------------------------
-// Notifier (Layer N)
-// ---------------------------------------------------------------------------
-
-export interface NotifierDeps {
-    client: TelegramClient;
-    chatId: string;
-    /** ctx.ui.notify stand-in; used for contained error surfacing. */
-    notify: (message: string, level: "info" | "error") => void;
-    host?: string;
-}
-
-interface OpenQuestion {
-    messageId: number;
-    startedAt: number;
-    text: string;
-}
-
-const ERROR_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
-
-export function createNotifier(deps: NotifierDeps) {
-    const open = new Map<string, OpenQuestion>();
-    /** toolCallIds whose send is still in flight; if they end first, edit on landing. */
-    const pendingEnds = new Map<string, { summary?: string; isError: boolean; startedAt: number }>();
-    let lastErrorNotify = 0;
-
-    /** Surface at most one Telegram failure notice per interval; never throw to pi. */
-    const fail = (err: unknown) => {
-        if (Date.now() - lastErrorNotify < ERROR_NOTIFY_INTERVAL_MS) return;
-        lastErrorNotify = Date.now();
-        const message = err instanceof Error ? err.message : String(err);
-        deps.notify(`telegram notify failed: ${message}`, "error");
-    };
-
-    const waited = (startedAt: number): string => {
-        const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-        return secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
-    };
-
-    const editResolved = (messageId: number, text: string, startedAt: number, summary: string | undefined, isError: boolean): void => {
-        const resolved = isError ? `⚠️ closed with error (waited ${waited(startedAt)})` : `✅ resolved (waited ${waited(startedAt)})`;
-        const edit = summary ? `${text}\n\n<b>${resolved}</b>\n${escapeHtml(summary)}` : `${text}\n\n<b>${resolved}</b>`;
-        deps.client.editMessageText(deps.chatId, messageId, edit).catch(() => {
-            /* message may be deleted/unchanged; nothing to recover */
-        });
-    };
-
-    return {
-        onToolStart(event: { toolCallId: string; toolName: string; args?: unknown }, ctx: ExtensionContext): void {
-            if (event.toolName !== "ask_user_question" || open.has(event.toolCallId)) return;
-            const startedAt = Date.now();
-            const text = renderQuestionnaireMessage({
-                args: (event.args ?? {}) as QuestionnaireArgs,
-                host: deps.host ?? hostname(),
-                project: basename(ctx.cwd),
-                sessionName: ctx.sessionManager.getSessionName() ?? undefined,
-            });
-            deps.client
-                .sendMessage(deps.chatId, text)
-                .then(({ message_id }) => {
-                    const earlyEnd = pendingEnds.get(event.toolCallId);
-                    if (earlyEnd) {
-                        // Question already ended before the send landed — resolve immediately.
-                        pendingEnds.delete(event.toolCallId);
-                        editResolved(message_id, text, earlyEnd.startedAt, earlyEnd.summary, earlyEnd.isError);
-                        return;
-                    }
-                    open.set(event.toolCallId, { messageId: message_id, startedAt, text });
-                })
-                .catch(fail);
-        },
-
-        onToolEnd(event: { toolCallId: string; toolName: string; result?: unknown; isError?: boolean }): void {
-            if (event.toolName !== "ask_user_question") return;
-            const summary = resolveAnswerSummary(event.result);
-            const isError = event.isError === true;
-            const q = open.get(event.toolCallId);
-            if (!q) {
-                // Send still in flight — remember and let the landing send resolve it.
-                if (pendingEnds.size < 16) {
-                    pendingEnds.set(event.toolCallId, { summary, isError, startedAt: Date.now() });
-                }
-                return;
-            }
-            open.delete(event.toolCallId);
-            editResolved(q.messageId, q.text, q.startedAt, summary, isError);
-        },
-
-        /** Safety net: agent turn ended while a question was still open (abort, crash). */
-        drain(): void {
-            for (const [id, q] of open) {
-                open.delete(id);
-                pendingEnds.delete(id);
-                deps.client
-                    .editMessageText(deps.chatId, q.messageId, `${q.text}\n\n⚪ closed without an answer (turn ended) — waited ${waited(q.startedAt)}`)
-                    .catch(() => {});
-            }
-        },
-
-        get openCount(): number {
-            return open.size;
-        },
-    };
-}
-
-export type Notifier = ReturnType<typeof createNotifier>;
-
-// ---------------------------------------------------------------------------
-// Layer A — rpiv contract clone (provenance: plan §8(b), rpiv 2.7.1)
-// ask_user_question is NOT a pi builtin; it is registered by the npm package
-// @juicesharp/rpiv-ask-user-question. We shadow the same tool name (M0a: our
-// load-time registration wins) with a byte-compatible contract so the model
-// sees an identical tool. The package itself is not importable from a file
-// extension — hence this frozen clone. Re-clone when upgrading rpiv.
+// The ask_user_question tool — rpiv contract clone (provenance: plan §8(b),
+// rpiv 2.7.1). This file is the SOLE provider of the tool (ADR-0002); the
+// upstream npm package is intentionally not installed. The contract below is
+// a frozen, byte-compatible clone so the model sees the exact upstream tool.
+// The package is not importable from a file extension — hence the clone.
+// Re-diff against upstream releases; see CLONED_RPIV_VERSION / rpivStatusLine.
 // ---------------------------------------------------------------------------
 
 export const MAX_QUESTIONS = 4;
@@ -913,19 +800,19 @@ export async function runLocalWalker(
 }
 
 // ---------------------------------------------------------------------------
-// Layer A — the shadow tool
+// The tool definition (provider-of-record, ADR-0002)
 // ---------------------------------------------------------------------------
 
-export interface ShadowToolDeps {
+export interface AskUserQuestionDeps {
     getChat: () => { client: TelegramClient; chatId: string } | undefined;
-    notify: (message: string, level: "info" | "error") => void;
     host?: string;
 }
 
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
 
-// --- rpiv drift detection (ADR-0001: the *tool contract* is not covered by ----
-// --- rpiv's event stability policy — re-diff the clone on upgrades) ----------
+// --- rpiv drift detection (ADR-0002: we own the tool, but its contract is a ---
+// --- clone of upstream rpiv, whose stability policy covers events only — ------
+// --- re-diff the clone when upstream releases) --------------------------------
 
 /** The rpiv release the clone in this file was taken from. Bump when re-diffing. */
 export const CLONED_RPIV_VERSION = "2.7.1";
@@ -946,16 +833,17 @@ export function readInstalledRpivVersion(path: string = RPIV_PACKAGE_JSON): stri
 
 export function rpivStatusLine(installed: string | undefined): string {
     if (!installed) {
-        return `rpiv: not found (shadow clone stands alone — cloned from ${CLONED_RPIV_VERSION})`;
+        return `rpiv: upstream not installed ✓ (clone ${CLONED_RPIV_VERSION} is authoritative) — drift check: npm view @juicesharp/rpiv-ask-user-question version`;
     }
-    return installed === CLONED_RPIV_VERSION
-        ? `rpiv: ${installed} (matches cloned contract ✓)`
-        : `rpiv: ${installed} ⚠️ differs from cloned ${CLONED_RPIV_VERSION} — re-diff the clone (ADR-0001; plan §8b)`;
+    const drift = installed === CLONED_RPIV_VERSION
+        ? `matches clone ${CLONED_RPIV_VERSION}`
+        : `⚠️ differs from clone ${CLONED_RPIV_VERSION} — re-diff the clone (ADR-0002)`;
+    return `rpiv: ${installed} installed (${drift}) — remove the package, it can only conflict with this file's tool`;
 }
 
 const ERROR_NO_UI = "Error: UI not available (running in non-interactive mode)";
 
-export function buildShadowToolDefinition(pi: ExtensionAPI, deps: ShadowToolDeps) {
+export function buildAskUserQuestionTool(pi: ExtensionAPI, deps: AskUserQuestionDeps) {
     return {
         name: ASK_USER_QUESTION_TOOL_NAME,
         label: "Ask User Question",
@@ -1002,7 +890,6 @@ export function buildShadowToolDefinition(pi: ExtensionAPI, deps: ShadowToolDeps
                               host: deps.host ?? hostname(),
                               project: basename(ctx.cwd),
                               sessionName: ctx.sessionManager.getSessionName() ?? undefined,
-                              mode: "interactive",
                           }),
                           params,
                           signal: race.signal,
@@ -1073,89 +960,30 @@ const SAMPLE_ARGS: QuestionnaireArgs = {
 };
 
 export default function (pi: ExtensionAPI) {
-    if (process.env.HERDR_ENV !== "1") {
-        return;
-    }
-
-    let notifier: Notifier | undefined;
-    let lastNotify: ((message: string, level: "info" | "error") => void) | undefined;
-    let shadowRegistered = false;
-
     const getChat = (): { client: TelegramClient; chatId: string } | undefined => {
         const { config } = loadConfig();
         if (!config || !config.enabled) return undefined;
         return { client: createTelegramClient(config.botToken), chatId: config.chatId };
     };
 
-    /**
-     * Register the same-name shadow when enabled. M0a: our load-time registration
-     * deterministically wins over the rpiv npm package (packages resolve before
-     * local extensions). Post-load re-registration (setup, /telegram on) also wins
-     * — last write takes the name. There is no unregister: after /telegram off a
-     * /reload is needed to restore the original rpiv tool.
-     */
-    const syncShadow = (): void => {
-        const { config } = loadConfig();
-        if (!config?.enabled) return;
-        pi.registerTool(
-            buildShadowToolDefinition(pi, {
-                getChat,
-                notify: (message, level) => lastNotify?.(message, level),
-                host: hostname(),
-            }) as Parameters<ExtensionAPI["registerTool"]>[0],
-        );
-        shadowRegistered = true;
-    };
-
-    const activate = (): void => {
-        const { config } = loadConfig();
-        if (!config || !config.enabled) {
-            notifier = undefined;
-            return;
-        }
-        notifier = createNotifier({
-            client: createTelegramClient(config.botToken),
-            chatId: config.chatId,
-            notify: (message, level) => {
-                lastNotify?.(message, level);
-            },
-        });
-    };
-
-    const ensureNotifier = (ctx: ExtensionContext): void => {
-        lastNotify ??= (message, level) => ctx.ui.notify(message, level);
-        // Re-activate whenever absent: first use, or after /telegram on|off reset it.
-        if (!notifier) activate();
-    };
-
-    // Load-time shadow registration (must run before any question can fire).
-    syncShadow();
-
-    pi.on("tool_execution_start", (event, ctx) => {
-        ensureNotifier(ctx);
-        // The shadow's interactive message supersedes the plain notification —
-        // never send both for the same question.
-        if (shadowRegistered) return;
-        notifier?.onToolStart(event, ctx);
-    });
-    pi.on("tool_execution_end", (event) => {
-        if (shadowRegistered) return;
-        notifier?.onToolEnd(event);
-    });
-    pi.on("agent_end", () => {
-        notifier?.drain();
-    });
-    pi.on("session_shutdown", () => {
-        notifier?.drain();
-    });
+    // Provider-of-record (ADR-0002): register the tool unconditionally at load.
+    // This file owns ask_user_question — no npm package may register the name.
+    // getChat() re-reads the config on every call, so /telegram on|off takes
+    // effect on the very next question; no reload is ever needed.
+    pi.registerTool(
+        buildAskUserQuestionTool(pi, {
+            getChat,
+            host: hostname(),
+        }) as Parameters<ExtensionAPI["registerTool"]>[0],
+    );
 
     pi.registerCommand("telegram", {
-        description: "Herdr Telegram bridge: setup, status, on/off, test",
+        description: "Telegram bridge for ask_user_question: setup, status, on/off, test",
         handler: async (args: string, ctx) => {
             const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
             switch (sub) {
                 case "setup":
-                    await runSetup(ctx, () => syncShadow());
+                    await runSetup(ctx);
                     return;
                 case "on":
                 case "off": {
@@ -1169,14 +997,12 @@ export default function (pi: ExtensionAPI) {
                         return;
                     }
                     writeConfigFile({ ...config, enabled: sub === "on" });
-                    notifier = undefined; // re-activate lazily with fresh config
                     if (sub === "on") {
-                        syncShadow();
                         ctx.ui.notify("Telegram enabled — ask_user_question is now answered remotely or at the terminal.", "info");
                     } else {
-                        // No unregister API exists; our shadow keeps serving the name in
-                        // local-only mode until a /reload re-evaluates the extension.
-                        ctx.ui.notify("Telegram disabled. Note: run /reload to fully restore the original ask_user_question tool (until then it falls back to local-only dialogs).", "info");
+                        // The tool stays registered (we own it); getChat() re-reads
+                        // the config per call, so this takes effect immediately.
+                        ctx.ui.notify("Telegram disabled — ask_user_question is local-only from the next question (effective immediately, no reload needed).", "info");
                     }
                     return;
                 }
@@ -1211,10 +1037,10 @@ export default function (pi: ExtensionAPI) {
                     // status (also the no-arg help)
                     const { config, source, split } = loadConfig();
                     const lines = [
-                        `herdr: ${process.env.HERDR_ENV === "1" ? "yes" : "no (extension inert)"}`,
+                        `herdr env: ${process.env.HERDR_ENV === "1" ? "yes" : "no"}`,
                         `config: ${source}${split ? " (partial env config: set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)" : ""}`,
                         `token: ${config ? "set" : "missing"} · chat: ${config?.chatId ? "set" : "missing"} · enabled: ${config?.enabled ?? false}`,
-                        `tool: ${shadowRegistered ? "shadowed — answer via Telegram or terminal" : config?.enabled ? "notify-only (shadow will register on /reload)" : "original rpiv tool untouched"}`,
+                        `tool: ask_user_question owned by this file — ${config?.enabled ? "Telegram + terminal race" : "local-only (terminal)"}`,
                         rpivStatusLine(readInstalledRpivVersion()),
                         `file: ${CONFIG_PATH}`,
                     ];
@@ -1230,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
 // /telegram setup
 // ---------------------------------------------------------------------------
 
-async function runSetup(ctx: ExtensionContext, onSuccess?: () => void): Promise<void> {
+async function runSetup(ctx: ExtensionContext): Promise<void> {
     const existing = readConfigFile();
 
     const tokenInput = (await ctx.ui.input(
@@ -1280,7 +1106,6 @@ async function runSetup(ctx: ExtensionContext, onSuccess?: () => void): Promise<
         }
         await client.sendMessage(chatId, "✅ herdr-telegram-ask connected — pi will message you here when it needs input.");
         writeConfigFile({ botToken, chatId, enabled: true });
-        onSuccess?.();
         ctx.ui.notify(`Saved ${CONFIG_PATH} (0600). ask_user_question is now answered remotely or at the terminal — /telegram test to verify.`, "info");
     } catch (err) {
         ctx.ui.notify(`Setup failed: ${err instanceof Error ? err.message : String(err)}`, "error");

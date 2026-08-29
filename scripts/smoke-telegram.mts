@@ -12,7 +12,6 @@ import type { TelegramClient } from "../herdr-telegram-ask.ts";
 
 const homeTmp = mkdtempSync(join(tmpdir(), "smoke-tg-home-"));
 process.env.HOME = homeTmp;
-process.env.HERDR_ENV = "1";
 
 const mod = await import("../herdr-telegram-ask.ts");
 
@@ -77,7 +76,6 @@ const msg = mod.renderQuestionnaireMessage({
     project: "jreb-pi-extensions",
     sessionName: "refactor-ask",
     now: new Date("2025-08-29T14:32:00"),
-    mode: "interactive",
 });
 for (const expected of [
     "pi needs your input",
@@ -88,11 +86,6 @@ for (const expected of [
     "<i>(pick any)</i>",
     "Tap an option or reply with text",
 ]) ok(`message contains: ${expected.slice(0, 30)}`, msg.includes(expected), msg);
-ok(
-    "notify mode footer",
-    mod.renderQuestionnaireMessage({ args: { questions: [] }, host: "h", project: "p", mode: "notify" }).includes("remote answering unavailable"),
-);
-
 const huge = mod.renderQuestionnaireMessage({
     args: {
         questions: Array.from({ length: 12 }, (_, i) => ({
@@ -111,14 +104,7 @@ ok(
     mod.renderQuestionnaireMessage({ args: {}, host: "h", project: "p" }).includes("could not be parsed"),
 );
 
-// --- answer summary -----------------------------------------------------------
-ok(
-    "summary from result",
-    mod.resolveAnswerSummary({ content: [{ type: "text", text: "User has answered your questions: \"Q\"=\"A\"." }] })?.includes("answered") === true,
-);
-ok("summary undefined without content", mod.resolveAnswerSummary({}) === undefined);
-
-// --- notifier -----------------------------------------------------------------
+// --- shared fake client (used by the elapsed-edit session test below) --------
 const notifications: Array<{ message: string; level: string }> = [];
 const sent: Array<{ text: string; messageId: number }> = [];
 const edits: Array<{ messageId: number; text: string }> = [];
@@ -137,85 +123,6 @@ const fakeClient: TelegramClient = {
     answerCallbackQuery: async () => true,
     getUpdates: async () => [],
 };
-const notifier = mod.createNotifier({
-    client: fakeClient,
-    chatId: "42",
-    notify: (message, level) => notifications.push({ message, level }),
-    host: "golem",
-});
-
-const stubCtx: any = {
-    cwd: "/Users/johannes/projects/jreb-pi-extensions",
-    ui: { notify: () => {}, input: async () => undefined },
-    sessionManager: { getSessionName: () => "smoke" },
-};
-
-notifier.onToolStart({ toolCallId: "x", toolName: "bash", args: {} }, stubCtx);
-ok("non-ask tools ignored", sent.length === 0);
-
-notifier.onToolStart({ toolCallId: "q1", toolName: "ask_user_question", args: { questions: [{ question: "Q1?", options: [{ label: "a" }, { label: "b" }] }] } }, stubCtx);
-await tick();
-ok("question sends one message", sent.length === 1 && sent[0].text.includes("Q1?"));
-ok("open count 1", notifier.openCount === 1);
-
-notifier.onToolEnd({ toolCallId: "q1", toolName: "ask_user_question", result: { content: [{ type: "text", text: "User has answered your questions: \"Q1?\"=\"a\"." }] } });
-await tick();
-ok("resolved edit ✅ with summary", edits.length === 1 && edits[0].text.includes("✅ resolved") && edits[0].text.includes("&quot;Q1?&quot;=&quot;a&quot;") === false && edits[0].text.includes("User has answered"), edits[0]?.text.slice(-200));
-ok("open count 0 after end", notifier.openCount === 0);
-
-// duplicate end is a no-op
-notifier.onToolEnd({ toolCallId: "q1", toolName: "ask_user_question", result: {} });
-await tick();
-ok("duplicate end ignored", edits.length === 1);
-
-// error end
-notifier.onToolStart({ toolCallId: "q2", toolName: "ask_user_question", args: { questions: [{ question: "Q2?", options: [{ label: "a" }, { label: "b" }] }] } }, stubCtx);
-await tick();
-notifier.onToolEnd({ toolCallId: "q2", toolName: "ask_user_question", result: {}, isError: true });
-await tick();
-ok("error end ⚠️", edits.length === 2 && edits[1].text.includes("⚠️ closed with error"));
-
-// drain
-notifier.onToolStart({ toolCallId: "q3", toolName: "ask_user_question", args: { questions: [{ question: "Q3?", options: [{ label: "a" }, { label: "b" }] }] } }, stubCtx);
-await tick();
-notifier.drain();
-await tick();
-ok("drain edits ⚪ and clears", edits.length === 3 && edits[2].text.includes("⚪ closed without an answer") && notifier.openCount === 0);
-
-// send failure → contained notify, rate-limited
-const failing: TelegramClient = {
-    ...fakeClient,
-    sendMessage: async () => {
-        throw new mod.TelegramApiError("sendMessage", "Unauthorized");
-    },
-};
-const failNotifier = mod.createNotifier({ client: failing, chatId: "42", notify: (message, level) => notifications.push({ message, level }) });
-failNotifier.onToolStart({ toolCallId: "f1", toolName: "ask_user_question", args: {} }, stubCtx);
-await tick();
-failNotifier.onToolStart({ toolCallId: "f2", toolName: "ask_user_question", args: {} }, stubCtx);
-await tick();
-const errNotifies = notifications.filter((n) => n.level === "error");
-ok("send failure notified once (rate-limited)", errNotifies.length === 1 && errNotifies[0].message.includes("Unauthorized"), errNotifies);
-
-// early-end race: end arrives while the send is still in flight
-let releaseSend: (() => void) | undefined;
-const slowClient: TelegramClient = {
-    ...fakeClient,
-    sendMessage: (_c: string, text: string) =>
-        new Promise((resolve) => {
-            releaseSend = () => resolve({ message_id: 777 });
-            void text;
-        }),
-};
-const raceNotifier = mod.createNotifier({ client: slowClient, chatId: "42", notify: () => {} });
-raceNotifier.onToolStart({ toolCallId: "r1", toolName: "ask_user_question", args: {} }, stubCtx);
-raceNotifier.onToolEnd({ toolCallId: "r1", toolName: "ask_user_question", result: { content: [{ type: "text", text: "User has answered your questions." }] } });
-await tick();
-ok("no edit while send in flight", edits.length === 3 || edits.every((e) => e.messageId !== 777));
-releaseSend?.();
-await tick();
-const lateEdit = edits.find((e) => e.messageId === 777);
-ok("early end resolved once send lands", !!lateEdit && lateEdit.text.includes("✅ resolved"), edits.map((e) => e.messageId));
 
 // --- extension wiring (default export) ----------------------------------------
 const captured: { handlers: Record<string, any[]>; commands: Record<string, any>; tools: Map<string, any> } = { handlers: {}, commands: {}, tools: new Map() };
@@ -226,13 +133,15 @@ const piStub: any = {
     events: { emit: () => {} },
 };
 
+// ADR-0002: no HERDR_ENV gating — tool + command register everywhere.
 delete process.env.HERDR_ENV;
 mod.default(piStub);
-ok("inert without HERDR_ENV", Object.keys(captured.commands).length === 0 && Object.keys(captured.handlers).length === 0);
+ok("registers tool + /telegram without HERDR_ENV", Object.keys(captured.commands).length === 1 && captured.tools.has("ask_user_question"));
 
 process.env.HERDR_ENV = "1";
 mod.default(piStub);
-ok("registers /telegram + handlers", !!captured.commands.telegram && ["tool_execution_start", "tool_execution_end", "agent_end", "session_shutdown"].every((e) => captured.handlers[e]?.length === 1));
+ok("registers tool + /telegram under Herdr", !!captured.commands.telegram && captured.tools.has("ask_user_question"));
+ok("no lifecycle handlers (notifier layer removed)", Object.keys(captured.handlers).length === 0);
 
 const cmdNotifications: string[] = [];
 const cmdCtx: any = {
@@ -247,27 +156,12 @@ const cmdCtx: any = {
 // status reflects the config written earlier in this script (same temp HOME)
 await captured.commands.telegram.handler("", cmdCtx);
 ok("status reports file config", cmdNotifications.some((m) => m.includes("config: file") && m.includes("enabled: true")));
-const singleQPlaceholder = { questions: [{ question: "Wired?", options: [{ label: "a" }, { label: "b" }] }] };
+ok("status reports owned tool + drift hint", cmdNotifications.some((m) => m.includes("owned by this file") && m.includes("Telegram + terminal race") && m.includes("rpiv: upstream not installed") && m.includes("drift check")));
 
-// write config (enabled) — the shadow registers and supersedes the notifier
-calls.length = 0;
-script = (_m, body) => {
-    if (_m === "sendMessage") return { message_id: 555 };
-    if (_m === "editMessageText") return true;
-    return { id: 1, username: "bot" };
-};
-ok("shadow registered at load when enabled", captured.tools.has("ask_user_question"));
-await captured.handlers.tool_execution_start[0](
-    { toolCallId: "w1", toolName: "ask_user_question", args: singleQPlaceholder },
-    cmdCtx,
-);
-await tick();
-ok("notifier suppressed while shadow registered", callsOf("sendMessage").length === 0);
-
-// /telegram off disables; /telegram on re-enables (shadow stays registered — no unregister API)
+// /telegram off disables remote answering immediately (tool stays registered — we own it)
 await captured.commands.telegram.handler("off", cmdCtx);
 ok("/telegram off writes config", JSON.parse(readFileSync(cfgPath, "utf-8")).chatId === "42" && JSON.parse(readFileSync(cfgPath, "utf-8")).enabled === false);
-ok("/telegram off explains /reload", cmdNotifications.some((m) => m.includes("reload")));
+ok("/telegram off announces immediate local-only", cmdNotifications.some((m) => m.includes("local-only") && m.includes("no reload")));
 
 await captured.commands.telegram.handler("on", cmdCtx);
 ok("/telegram on re-enables", JSON.parse(readFileSync(cfgPath, "utf-8")).enabled === true);
@@ -395,21 +289,21 @@ const makeExecCtx = (selectImpl: any) => ({
 const hangingSelect = (_t: string, _o: string[], opts?: any) =>
     new Promise<string | undefined>((res) => opts?.signal?.addEventListener("abort", () => res(undefined)));
 const chatDeps = () => ({ client: mod.createTelegramClient("TK"), chatId: "42" });
-const shadowDef: any = mod.buildShadowToolDefinition(piForTool, { getChat: chatDeps, notify: () => {}, host: "golem" });
+const toolDef: any = mod.buildAskUserQuestionTool(piForTool, { getChat: chatDeps, host: "golem" });
 
 const singleQ = { questions: [{ question: "Deploy?", header: "Deploy", options: [{ label: "Yes", description: "ship" }, { label: "No", description: "wait" }] }] };
 const multiQ = { questions: [{ question: "Checks?", header: "Checks", multiSelect: true, options: [{ label: "typecheck", description: "" }, { label: "smoke", description: "" }] }] };
 
 // hasUI=false → no_ui envelope, nothing sent
-let r: any = await shadowDef.execute("t0", singleQ, undefined, undefined, { ...makeExecCtx(hangingSelect), hasUI: false });
+let r: any = await toolDef.execute("t0", singleQ, undefined, undefined, { ...makeExecCtx(hangingSelect), hasUI: false });
 ok("no_ui envelope when headless", r.content[0].text.includes("UI not available") && tgCalls.length === 0);
 
 // invalid questionnaire → error envelope
-r = await shadowDef.execute("t0", { questions: [mkQ("Q?", ["Other", "b"])] }, undefined, undefined, makeExecCtx(hangingSelect));
+r = await toolDef.execute("t0", { questions: [mkQ("Q?", ["Other", "b"])] }, undefined, undefined, makeExecCtx(hangingSelect));
 ok("reserved label envelope", r.content[0].text.includes("reserved"));
 
 // remote wins: tap option 0 of a single question
-let p = shadowDef.execute("t1", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
+let p = toolDef.execute("t1", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
 await tick();
 updateQueue.push(cbUpdate(`${keyboardNonce.value}:0`));
 r = await settle(p);
@@ -419,7 +313,7 @@ ok("final edit ✅ via Telegram", tgCalls.some((c) => c.method === "editMessageT
 ok("final edit clears keyboard", tgCalls.filter((c) => c.method === "editMessageText").every((c) => c.body.reply_markup === undefined || c.body.reply_markup === undefined));
 
 // remote multi: toggle 0, toggle 0 again (off), toggle 1, submit
-p = shadowDef.execute("t2", multiQ, undefined, undefined, makeExecCtx(hangingSelect));
+p = toolDef.execute("t2", multiQ, undefined, undefined, makeExecCtx(hangingSelect));
 await tick();
 const n = keyboardNonce.value;
 updateQueue.push(cbUpdate(`${n}:0`), cbUpdate(`${n}:0`), cbUpdate(`${n}:1`), cbUpdate(`${n}:sub`));
@@ -427,14 +321,14 @@ r = await settle(p);
 ok("remote multi submit", r.content[0].text.includes('"Checks?"="smoke"'), r.content[0].text);
 
 // free text → custom answer
-p = shadowDef.execute("t3", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
+p = toolDef.execute("t3", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
 await tick();
 updateQueue.push(msgUpdate("do it live"));
 r = await settle(p);
 ok("remote free-text custom", r.content[0].text.includes('"Deploy?"="do it live"'), r.content[0].text);
 
 // stale nonce + foreign chat ignored, then a valid tap still works
-p = shadowDef.execute("t4", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
+p = toolDef.execute("t4", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
 await tick();
 const stale = cbUpdate(`deadbeef:0`);
 const foreign = cbUpdate(`${keyboardNonce.value}:0`, 999);
@@ -446,7 +340,7 @@ ok("stale nonce acked expired", tgCalls.some((c) => c.method === "answerCallback
 // leave-for-terminal: remote yields, local wins
 let resolveLocal: ((v: string | undefined) => void) | undefined;
 const manualSelect = (_t: string, _o: string[], _opts?: any) => new Promise<string | undefined>((res) => (resolveLocal = res));
-p = shadowDef.execute("t5", singleQ, undefined, undefined, makeExecCtx(manualSelect));
+p = toolDef.execute("t5", singleQ, undefined, undefined, makeExecCtx(manualSelect));
 await tick();
 updateQueue.push(cbUpdate(`${keyboardNonce.value}:x`));
 await tick();
@@ -455,7 +349,7 @@ r = await settle(p);
 ok("leave-for-terminal → local wins", r.content[0].text.includes('"Deploy?"="No"'));
 ok("local win edits ⌨️ at terminal", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("answered at the terminal")));
 // local cancel (Esc) → decline envelope with partial answers in details
-p = shadowDef.execute("t6", { questions: [singleQ.questions[0], mkQ("Second?")] }, undefined, undefined, makeExecCtx(manualSelect));
+p = toolDef.execute("t6", { questions: [singleQ.questions[0], mkQ("Second?")] }, undefined, undefined, makeExecCtx(manualSelect));
 await tick();
 resolveLocal?.(undefined); // Esc on first question
 r = await settle(p);
@@ -464,7 +358,7 @@ ok("local cancel edits ✖ declined", tgCalls.some((c) => c.method === "editMess
 
 // agent abort mid-question → decline + ⚪ close on telegram
 const acAbort = new AbortController();
-p = shadowDef.execute("t7", singleQ, acAbort.signal, undefined, makeExecCtx(hangingSelect));
+p = toolDef.execute("t7", singleQ, acAbort.signal, undefined, makeExecCtx(hangingSelect));
 await tick();
 acAbort.abort();
 r = await settle(p);
@@ -477,13 +371,13 @@ mod.__setDefaultTransportForTests((async (_url: string, init?: RequestInit) => {
     if (method === "sendMessage") return new Response(JSON.stringify({ ok: false, description: "Unauthorized" }), { status: 400 });
     return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
 }) as any);
-p = shadowDef.execute("t8", singleQ, undefined, undefined, makeExecCtx(manualSelect));
+p = toolDef.execute("t8", singleQ, undefined, undefined, makeExecCtx(manualSelect));
 await tick();
 resolveLocal?.("Yes");
 r = await settle(p);
 ok("telegram down → local fallback", r.content[0].text.includes('"Deploy?"="Yes"'));
 
-// --- M2: default-export registration gating ------------------------------------
+// --- ADR-0002: registration is unconditional ----------------------------------
 const piReg: any = {
     events: { emit: () => {} },
     on: (event: string, handler: any) => ((piReg.handlers as any) ??= {})[event] ??= [handler],
@@ -494,13 +388,13 @@ const piReg: any = {
 };
 // config currently enabled (NEWTOKEN from the setup test)
 mod.default(piReg);
-ok("shadow registered when enabled", piReg.tools.has("ask_user_question"));
+ok("tool registered when enabled", piReg.tools.has("ask_user_question"));
 mod.writeConfigFile({ botToken: "T1", chatId: "42", enabled: false });
 const piReg2: any = { events: { emit: () => {} }, on: () => {}, registerCommand: () => {}, tools: new Map(), registerTool: function (t: any) { this.tools.set(t.name, t); } };
 mod.default(piReg2);
-ok("no shadow when disabled", piReg2.tools.size === 0);
+ok("tool registered (local-only) even when disabled", piReg2.tools.has("ask_user_question"));
 
-// notifier suppressed while shadow registered
+// no chat configured → execute degrades to local-only, nothing ever sent
 tgCalls.length = 0;
 mod.__setDefaultTransportForTests((async (_url: string, init?: RequestInit) => {
     const method = _url.split("/").pop() ?? "";
@@ -510,10 +404,12 @@ mod.__setDefaultTransportForTests((async (_url: string, init?: RequestInit) => {
     if (method === "sendMessage") return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
     return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
 }) as any);
-const wiredCtx = makeExecCtx(hangingSelect);
-await (piReg.handlers as any).tool_execution_start[0]({ toolCallId: "s1", toolName: "ask_user_question", args: singleQ }, wiredCtx);
+const localOnlyTool: any = mod.buildAskUserQuestionTool(piForTool, { getChat: () => undefined, host: "golem" });
+const localP = localOnlyTool.execute("l1", singleQ, undefined, undefined, makeExecCtx(manualSelect));
 await tick();
-ok("notifier suppressed while shadow registered", tgCalls.filter((c) => c.method === "sendMessage").length === 0);
+resolveLocal?.("Yes");
+const localR: any = await settle(localP);
+ok("no chat → local-only answer, nothing sent", localR.content[0].text.includes('"Deploy?"="Yes"') && tgCalls.filter((c) => c.method === "sendMessage").length === 0);
 
 // --- M3+: elapsed-time edits ----------------------------------------------------
 ok("formatElapsed", mod.formatElapsed(0) === "0s" && mod.formatElapsed(59_000) === "59s" && mod.formatElapsed(60_000) === "1m" && mod.formatElapsed(194_000) === "3m 14s");
@@ -552,9 +448,9 @@ ok("formatElapsed", mod.formatElapsed(0) === "0s" && mod.formatElapsed(59_000) =
 }
 
 // --- M3+: rpiv drift warning ----------------------------------------------------
-ok("drift line matches", mod.rpivStatusLine("2.7.1").includes("matches cloned contract"));
-ok("drift line warns", mod.rpivStatusLine("2.8.0").includes("⚠️") && mod.rpivStatusLine("2.8.0").includes("2.7.1"));
-ok("drift line absent install", mod.rpivStatusLine(undefined).includes("not found"));
+ok("drift line matches", mod.rpivStatusLine("2.7.1").includes("matches clone 2.7.1") && mod.rpivStatusLine("2.7.1").includes("remove the package"));
+ok("drift line warns", mod.rpivStatusLine("2.8.0").includes("⚠️") && mod.rpivStatusLine("2.8.0").includes("2.7.1") && mod.rpivStatusLine("2.8.0").includes("re-diff"));
+ok("drift line absent install", mod.rpivStatusLine(undefined).includes("upstream not installed") && mod.rpivStatusLine(undefined).includes("drift check"));
 
 // cleanup
 mod.__setDefaultTransportForTests(undefined);
