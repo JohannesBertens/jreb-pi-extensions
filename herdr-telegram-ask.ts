@@ -632,7 +632,7 @@ export interface RemoteSession {
     /** Resolves ONLY on a complete remote answer. Dismissal/failure: never settles. */
     readonly result: Promise<QuestionnaireResult>;
     /** Edit the Telegram message after the race was decided elsewhere. */
-    settledRemotely(summaryLines: string[]): void;
+    settledRemotely(summaryLines: string[], outcome: "answered" | "declined"): void;
     closedExternally(reason: string): void;
 }
 
@@ -787,10 +787,12 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
 
     return {
         result,
-        settledRemotely(summaryLines: string[]) {
+        settledRemotely(summaryLines: string[], outcome: "answered" | "declined") {
             if (settled || state.messageId === 0) return;
             settled = true;
-            edit(`${state.base}\n\n${summaryLines.join("\n")}\n\n<b>⌨️ answered at the terminal</b>`);
+            const closing = outcome === "declined" ? "<b>✖ declined at the terminal</b>" : "<b>⌨️ answered at the terminal</b>";
+            const summary = summaryLines.length ? `\n${summaryLines.join("\n")}\n` : "\n";
+            edit(`${state.base}\n${summary}\n${closing}`);
         },
         closedExternally(reason: string) {
             if (settled || state.messageId === 0) return;
@@ -957,6 +959,7 @@ export function buildShadowToolDefinition(pi: ExtensionAPI, deps: ShadowToolDeps
                         winner.result.answers.map(
                             (a) => `✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`,
                         ),
+                        winner.result.cancelled ? "declined" : "answered",
                     );
                     return buildQuestionnaireResponse(winner.result, params);
                 }

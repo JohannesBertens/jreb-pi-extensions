@@ -35,6 +35,19 @@ For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Tel
 
 **Privacy:** question content and answers transit Telegram's cloud. That is the point of the tool — but it is opt-in per the config above.
 
+**Manual E2E checklist** (run after install/upgrade, ~5 min):
+
+1. **Single-select from phone** — trigger a one-question ask; tap an option in Telegram → message edits to `✅ answered via Telegram`, session shows the answer envelope.
+2. **multiSelect from phone** — toggle two options, `✅ Submit` → answer envelope lists both labels.
+3. **Free text** — reply to the message with plain text → arrives as a custom answer.
+4. **Leave for terminal** — tap `✕ Leave for terminal`, answer at the TUI → message edits `⌨️ answered at the terminal`.
+5. **Decline at terminal** — press Esc locally → envelope declines; message edits `✖ declined at the terminal`.
+6. **Multi-question wizard** — a 2+ question ask walks the phone through questions one at a time (progress lines above the keyboard).
+7. **Concurrent sessions** — open questions in two pi processes at once → both remain locally answerable; one process's polling backs off (Telegram `409`) — phone answering may be briefly slow, never blocked.
+8. **Network loss** — go offline mid-question → terminal answering unaffected; the open Telegram message simply never gets its ✅ edit, and later taps on it spin out (polling already stopped) — expected.
+9. **Herdr readout** — while a question is open, the Herdr pane shows red/blocked (the sibling `herdr-blocked-on-question` extension keeps working through the shadow).
+10. **Sanity** — `/telegram status` shows `tool: shadowed`; `/telegram test` send+edit round-trips.
+
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 
 > **Status: provisional** — a stopgap companion to the Herdr-managed

@@ -454,13 +454,13 @@ resolveLocal?.("No");
 r = await settle(p);
 ok("leave-for-terminal → local wins", r.content[0].text.includes('"Deploy?"="No"'));
 ok("local win edits ⌨️ at terminal", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("answered at the terminal")));
-
 // local cancel (Esc) → decline envelope with partial answers in details
 p = shadowDef.execute("t6", { questions: [singleQ.questions[0], mkQ("Second?")] }, undefined, undefined, makeExecCtx(manualSelect));
 await tick();
 resolveLocal?.(undefined); // Esc on first question
 r = await settle(p);
 ok("local cancel declines", r.content[0].text === "User declined to answer questions" && r.details.cancelled === true);
+ok("local cancel edits ✖ declined", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("✖ declined at the terminal")));
 
 // agent abort mid-question → decline + ⚪ close on telegram
 const acAbort = new AbortController();
