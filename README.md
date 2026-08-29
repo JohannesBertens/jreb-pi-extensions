@@ -43,6 +43,8 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 **Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).
 
+**Shared plumbing:** the Telegram client, config file and the single per-process `getUpdates` loop (PollHub) live in `herdr-telegram-core.ts`; this file re-exports the moved names, and the wizard's remote window subscribes to the shared hub instead of polling on its own (buttons from `herdr-telegram-progress` and wizard taps route through one loop — no mutual `409`s inside a process).
+
 **Privacy:** question content and answers transit Telegram's cloud. That is the point of the tool — but it is opt-in per the config above.
 
 **Manual E2E checklist** (run after install/upgrade, ~5 min):
@@ -57,6 +59,45 @@ Colorful statusline showing token usage, context window progress, git branch, an
 8. **Network loss** — go offline mid-question → terminal answering unaffected; the open Telegram message simply never gets its ✅ edit, and later taps on it spin out (polling already stopped) — expected.
 9. **Herdr readout** — while a question is open, the Herdr pane shows red/blocked (the sibling `herdr-blocked-on-question` extension tracks the tool by name and keeps working).
 10. **Sanity** — `/telegram status` shows `tool: ask_user_question owned by this file`; `/telegram test` send+edit round-trips.
+
+### Herdr Telegram Progress (`herdr-telegram-progress.ts` + `herdr-telegram-core.ts`)
+
+**Track pi agent runs from Telegram.** While a run is open (`agent_start` … `agent_settled`) you get one **silent** live message per run — edited in place at most every ~10 s — showing recent tool activity, turn count, elapsed time and token totals; when the run settles you get an **audible** summary (turns · tools · errors · elapsed · tokens · cost · last answer preview). The first mid-run tool error sends one audible `⚠️` ping per run. Blocking dialogs from *other* extensions (`ui.confirm`-style gates, wizards) ping `🔔 pi is blocked on a dialog` — notify-only, since pi has no API to answer foreign dialogs remotely.
+
+```
+🚀 run · jreb-pi-extensions · plan-tg
+├── ✅ bash · npm run typecheck
+└── ⚙️ bash · npx tsx scripts/smoke-telegram.mts · 34s
+
+⏳ turn 3 · 4m 12s · ↑12.3k ↓4.5k tok
+[📋 tasks] [⏹ stop] [🔁 refresh]
+```
+
+**Buttons** (live on the run message; routed through the shared poll hub):
+- `📋 tasks` — the session's todo list (replayed read-only from the last `todo` tool result; ✔ done · ◐ in progress · □ pending) as a toast, or a message when long.
+- `⏹ stop` — aborts the current agent run (`ctx.abort()`); the settle summary reads `⏹ stopped`.
+- `🔁 refresh` — immediate status edit, bypassing the throttle.
+
+**Commands:** `/progress status` · `on` · `off` · `test` (60 s live button window for E2E).
+
+- Enabled by default once the ask config exists (`~/.pi/agent/herdr-telegram.json`); the optional `progress` flag in that file (or `/progress off`) disables it — takes effect on the next run, no `/reload`.
+- Env force-off: `TELEGRAM_PROGRESS=0`.
+- Dialog pings fire only **mid-run** (if you're running commands interactively you're at the terminal anyway) and are suppressed while `ask_user_question` is open — its wizard already messages.
+- **Concurrent sessions:** two pi processes share one bot token, so `getUpdates` can collide — taps on the other process's buttons get a toast naming the owner; retry shortly. Local work is never blocked (same stance as the ask wizard's `409` handling).
+
+**Privacy:** activity lines carry one-line summaries only (shell commands, file paths) — never file contents. They still transit Telegram's cloud; disable with `/progress off` if that's not acceptable.
+
+**Manual E2E checklist** (~5 min, after `/telegram setup`):
+
+1. **Live run** — kick off a multi-step task → silent run message appears, edits as tools complete.
+2. **Settle buzz** — on completion a new message arrives (turns/tools/tokens/cost + last answer preview).
+3. **Tasks** — create todos (`todo` tool) during a run → `📋 tasks` toast lists them with ✔/◐/□.
+4. **Stop** — tap `⏹ stop` mid-run → run aborts, summary reads `⏹ stopped`.
+5. **Refresh** — tap `🔁 refresh` → immediate edit with current state.
+6. **Dialog ping** — while a run is open, an extension `ctx.ui.confirm` dialog → audible 🔔 ping, ✅ edit on resolve (ask_user_question dialogs must NOT ping — the wizard covers them).
+7. **Error ping** — a failing tool mid-run → one audible ⚠️, settle summary counts `N ⚠️`.
+8. **Concurrent sessions** — runs in two pi processes → both tracked; cross-taps answer `owned by …`.
+9. **Sanity** — `/progress status` shows enabled/instance/poll-hub state; `/progress test` round-trips buttons.
 
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 

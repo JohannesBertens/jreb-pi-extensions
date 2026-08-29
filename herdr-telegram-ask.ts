@@ -16,157 +16,51 @@
  * newer release, re-diff the clone (schema/validator/envelope/meta) and bump
  * CLONED_RPIV_VERSION.
  *
+ * Transport, config, render helpers and the shared getUpdates loop (PollHub)
+ * live in `herdr-telegram-core.ts`; this file re-exports the moved names so
+ * scripts/smoke-telegram.mts (the ADR-0002 regression gate) stays unchanged.
+ *
  * Zero runtime dependencies: Node's global fetch only, and every network path is
  * funneled through an injectable Transport so scripts/smoke-telegram.mts can run
  * the whole thing without touching the network.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+    createTelegramClient,
+    escapeHtml,
+    getChat,
+    getSharedPollHub,
+    loadConfig,
+    MAX_MESSAGE_CHARS,
+    oneLine,
+    readConfigFile,
+    writeConfigFile,
+    type PollHub,
+    type PollLease,
+    type TelegramClient,
+    type TelegramUpdate,
+    type UpdateHandler,
+    formatElapsed,
+} from "./herdr-telegram-core.ts";
 import { hostname } from "node:os";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { type Static, Type } from "typebox";
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
+// Compatibility re-exports: these moved to herdr-telegram-core.ts, but the
+// offline smoke suite (and any external consumers) imports them from here.
+export {
+    __setDefaultTransportForTests,
+    createTelegramClient,
+    loadConfig,
+    readConfigFile,
+    writeConfigFile,
+    TelegramApiError,
+} from "./herdr-telegram-core.ts";
+export type { TelegramClient, TelegramConfig, TelegramUpdate, Transport } from "./herdr-telegram-core.ts";
 
-export interface TelegramConfig {
-    botToken: string;
-    chatId: string;
-    enabled: boolean;
-}
-
-const CONFIG_DIR = join(process.env.HOME ?? "~", ".pi", "agent");
-const CONFIG_PATH = join(CONFIG_DIR, "herdr-telegram.json");
-/** Telegram messages must stay under 4096 chars; leave headroom for the ✅ edit. */
-const MAX_MESSAGE_CHARS = 3800;
-
-export function readConfigFile(path: string = CONFIG_PATH): TelegramConfig | undefined {
-    if (!existsSync(path)) return undefined;
-    try {
-        const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<TelegramConfig>;
-        if (typeof raw.botToken !== "string" || raw.botToken.length === 0) return undefined;
-        if (typeof raw.chatId !== "string" || raw.chatId.length === 0) return undefined;
-        return { botToken: raw.botToken, chatId: raw.chatId, enabled: raw.enabled !== false };
-    } catch {
-        return undefined;
-    }
-}
-
-export function writeConfigFile(config: TelegramConfig, path: string = CONFIG_PATH): void {
-    writeFileSync(path, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
-    // writeFileSync mode only applies at creation; enforce on every save.
-    chmodSync(path, 0o600);
-}
-
-/** Precedence: env overrides file; `source` tells status/setup where each field came from. */
-export function loadConfig(
-    env: Record<string, string | undefined> = process.env,
-    path: string = CONFIG_PATH,
-): { config: TelegramConfig | undefined; source: "env" | "file" | "none"; split: boolean } {
-    const file = readConfigFile(path);
-    const envToken = env.TELEGRAM_BOT_TOKEN?.trim();
-    const envChat = env.TELEGRAM_CHAT_ID?.trim();
-    if (envToken && envChat) {
-        return { config: { botToken: envToken, chatId: envChat, enabled: file?.enabled ?? true }, source: "env", split: false };
-    }
-    if (envToken || envChat) {
-        // Partial env config is never usable — say so rather than half-work.
-        return { config: undefined, source: "none", split: true };
-    }
-    return { config: file, source: file ? "file" : "none", split: false };
-}
-
-// ---------------------------------------------------------------------------
-// Telegram client (Bot API subset, injectable transport)
-// ---------------------------------------------------------------------------
-
-/** Minimal transport so tests can stub all network I/O. */
-export type Transport = (url: string, init?: RequestInit) => Promise<Response>;
-
-let defaultTransport: Transport = globalThis.fetch.bind(globalThis);
-
-/** Test seam: swap the default transport so smoke tests never touch the network. */
-export function __setDefaultTransportForTests(transport: Transport | undefined): void {
-    defaultTransport = transport ?? globalThis.fetch.bind(globalThis);
-}
-
-export class TelegramApiError extends Error {
-    public readonly method: string;
-    public readonly description: string;
-    constructor(method: string, description: string) {
-        super(`Telegram ${method} failed: ${description}`);
-        this.name = "TelegramApiError";
-        this.method = method;
-        this.description = description;
-    }
-}
-
-interface TelegramResponse<T> {
-    ok: boolean;
-    result?: T;
-    description?: string;
-}
-
-export interface TelegramClient {
-    getMe(): Promise<{ id: number; username: string }>;
-    sendMessage(chatId: string, text: string, replyMarkup?: unknown): Promise<{ message_id: number }>;
-    editMessageText(chatId: string, messageId: number, text: string, replyMarkup?: unknown): Promise<boolean>;
-    answerCallbackQuery(callbackQueryId: string, text?: string): Promise<boolean>;
-    getUpdates(offset: number, timeoutSec: number, signal: AbortSignal): Promise<TelegramUpdate[]>;
-}
-
-export interface TelegramUpdate {
-    update_id: number;
-    message?: { chat: { id: number; type: string }; text?: string; message_id?: number };
-    callback_query?: {
-        id: string;
-        data?: string;
-        message?: { chat: { id: number; type: string }; message_id: number };
-    };
-}
-
-export function createTelegramClient(botToken: string, transport: Transport = defaultTransport): TelegramClient {
-    const call = async <T>(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<T> => {
-        const init: RequestInit = {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(params),
-            signal: signal ?? AbortSignal.timeout(15_000),
-        };
-        const res = await transport(`https://api.telegram.org/bot${botToken}/${method}`, init);
-        const data = (await res.json()) as TelegramResponse<T>;
-        if (!data.ok) throw new TelegramApiError(method, data.description ?? `HTTP ${res.status}`);
-        return data.result as T;
-    };
-    return {
-        getMe: () => call("getMe", {}),
-        sendMessage: (chatId, text, replyMarkup) =>
-            call("sendMessage", {
-                chat_id: chatId,
-                text,
-                parse_mode: "HTML",
-                link_preview_options: { is_disabled: true },
-                ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-            }),
-        editMessageText: (chatId, messageId, text, replyMarkup) =>
-            call<{ boolean: boolean }>("editMessageText", {
-                chat_id: chatId,
-                message_id: messageId,
-                text,
-                parse_mode: "HTML",
-                ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-            }).then(() => true),
-        answerCallbackQuery: (callbackQueryId, text) =>
-            call<{ boolean: boolean }>("answerCallbackQuery", {
-                callback_query_id: callbackQueryId,
-                ...(text ? { text } : {}),
-            }).then(() => true),
-        getUpdates: (offset, timeoutSec, signal) =>
-            call("getUpdates", { offset, timeout: timeoutSec, allowed_updates: ["message", "callback_query"] }, signal),
-    };
-}
+const CONFIG_PATH = join(process.env.HOME ?? "~", ".pi", "agent", "herdr-telegram.json");
 
 // ---------------------------------------------------------------------------
 // Message rendering
@@ -181,14 +75,7 @@ export interface QuestionnaireArgs {
     }>;
 }
 
-function escapeHtml(text: string): string {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function oneLine(text: string, max: number): string {
-    const flat = text.replace(/\s+/g, " ").trim();
-    return flat.length > max ? flat.slice(0, max - 1) + "…" : flat;
-}
+// (escapeHtml / oneLine are imported from herdr-telegram-core.ts.)
 
 export interface RenderInput {
     args: QuestionnaireArgs;
@@ -477,12 +364,9 @@ function currentQuestionline(state: RemoteSessionState): string {
     return `[${state.current + 1}/${state.params.questions.length}] ${q.question}`;
 }
 
-export function formatElapsed(ms: number): string {
-    const secs = Math.max(0, Math.floor(ms / 1000));
-    if (secs < 60) return `${secs}s`;
-    const mins = Math.floor(secs / 60);
-    return `${mins}m${secs % 60 ? ` ${secs % 60}s` : ""}`;
-}
+// formatElapsed lives in herdr-telegram-core.ts (shared with
+// herdr-telegram-progress.ts) and is re-exported below for the smoke suite.
+export { formatElapsed };
 
 /** Progress block appended to the base message while the wizard is running. */
 export function remoteProgressText(state: RemoteSessionState): string {
@@ -524,6 +408,8 @@ export interface RemoteSessionDeps {
     /** Elapsed-edit cadence (default 1 min) and cap (default 30 min) — test knobs. */
     tickMs?: number;
     maxElapsedMs?: number;
+    /** Shared-loop subscription (PollHub). Absent → internal window poll. */
+    subscribe?: (handler: UpdateHandler) => PollLease;
 }
 
 export interface RemoteSession {
@@ -559,6 +445,11 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
     let settled = false;
     let dismissed = false;
     let offset = 0;
+    let pollLease: PollLease | undefined;
+    const releasePoll = (): void => {
+        pollLease?.release();
+        pollLease = undefined;
+    };
 
     // Serialize edits: an elapsed edit already in flight must never land after a
     // later close edit (it would resurrect the keyboard on a resolved message).
@@ -575,6 +466,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
 
     const finishRemote = (): void => {
         settled = true;
+        releasePoll();
         const summary = state.answers.map((a) => `✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`);
         edit(`${state.base}\n\n${summary.join("\n")}\n\n<b>✅ answered via Telegram</b>`);
         resolveResult?.({ answers: state.answers, cancelled: false });
@@ -621,6 +513,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         if (settled) return;
         if (rest === "x") {
             dismissed = true;
+            releasePoll();
             ack("left for the terminal");
             edit(`${state.base}\n\n⌨️ left for the terminal`);
             return;
@@ -656,6 +549,28 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         advance({ questionIndex: state.current, question: q.question, kind: "custom", answer: text });
     };
 
+    /** Claim-routed update handler for the shared PollHub (and the legacy loop). */
+    const handleUpdate = (u: TelegramUpdate): boolean => {
+        if (u.callback_query) {
+            const cb = u.callback_query;
+            if (String(cb.message?.chat?.id ?? "") !== chatId) return false;
+            // "p:"-prefixed nonces belong to herdr-telegram-progress — never ours.
+            if ((cb.data ?? "").startsWith("p:")) return false;
+            handleCallback(cb);
+            return true;
+        }
+        if (u.message) {
+            const msg = u.message;
+            if (String(msg.chat?.id) !== chatId || msg.chat?.type !== "private") return false;
+            const text = (msg.text ?? "").trim();
+            if (!text || text.startsWith("/")) return false;
+            if (settled || dismissed) return false;
+            handleMessage(msg);
+            return true;
+        }
+        return false;
+    };
+
     const poll = async (): Promise<void> => {
         let backoff = 500;
         while (!settled && !dismissed && !signal.aborted) {
@@ -664,8 +579,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
                 backoff = 500;
                 for (const u of updates) {
                     offset = u.update_id + 1;
-                    if (u.callback_query) handleCallback(u.callback_query);
-                    else if (u.message) handleMessage(u.message);
+                    handleUpdate(u);
                     if (settled) return;
                 }
                 if (updates.length === 0) {
@@ -711,7 +625,14 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         .sendMessage(chatId, state.base + remoteProgressText(state), { inline_keyboard: buildKeyboard(state) })
         .then(({ message_id }) => {
             state.messageId = message_id;
-            void poll();
+            if (deps.subscribe) {
+                // Shared PollHub path: one getUpdates loop per process serves all
+                // subscribers (ask wizard windows, progress run buttons).
+                pollLease = deps.subscribe(handleUpdate);
+                signal.addEventListener("abort", releasePoll, { once: true });
+            } else {
+                void poll();
+            }
         })
         .catch(stopElapsed);
 
@@ -720,6 +641,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         settledRemotely(summaryLines: string[], outcome: "answered" | "declined") {
             if (settled || state.messageId === 0) return;
             settled = true;
+            releasePoll();
             const closing = outcome === "declined" ? "<b>✖ declined at the terminal</b>" : "<b>⌨️ answered at the terminal</b>";
             const summary = summaryLines.length ? `\n${summaryLines.join("\n")}\n` : "\n";
             edit(`${state.base}\n${summary}\n${closing}`);
@@ -727,6 +649,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         closedExternally(reason: string) {
             if (settled || state.messageId === 0) return;
             settled = true;
+            releasePoll();
             edit(`${state.base}\n\n⚪ ${escapeHtml(reason)}`);
         },
     };
@@ -806,6 +729,8 @@ export async function runLocalWalker(
 export interface AskUserQuestionDeps {
     getChat: () => { client: TelegramClient; chatId: string } | undefined;
     host?: string;
+    /** Poll hub the wizard subscribes to (default: the shared process hub). */
+    pollHub?: PollHub;
 }
 
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
@@ -881,6 +806,7 @@ export function buildAskUserQuestionTool(pi: ExtensionAPI, deps: AskUserQuestion
                 if (process.stdout.isTTY) process.stdout.write("\x07"); // terminal attention, rpiv parity
 
                 const chat = deps.getChat();
+                const pollHub = deps.pollHub ?? getSharedPollHub();
                 const remote = chat
                     ? startRemoteSession({
                           client: chat.client,
@@ -893,6 +819,7 @@ export function buildAskUserQuestionTool(pi: ExtensionAPI, deps: AskUserQuestion
                           }),
                           params,
                           signal: race.signal,
+                          subscribe: (handler) => pollHub.subscribe(handler),
                       })
                     : undefined;
 
@@ -960,16 +887,11 @@ const SAMPLE_ARGS: QuestionnaireArgs = {
 };
 
 export default function (pi: ExtensionAPI) {
-    const getChat = (): { client: TelegramClient; chatId: string } | undefined => {
-        const { config } = loadConfig();
-        if (!config || !config.enabled) return undefined;
-        return { client: createTelegramClient(config.botToken), chatId: config.chatId };
-    };
-
     // Provider-of-record (ADR-0002): register the tool unconditionally at load.
     // This file owns ask_user_question — no npm package may register the name.
-    // getChat() re-reads the config on every call, so /telegram on|off takes
-    // effect on the very next question; no reload is ever needed.
+    // getChat() (from herdr-telegram-core.ts) re-reads the config on every call,
+    // so /telegram on|off takes effect on the very next question; no reload is
+    // ever needed.
     pi.registerTool(
         buildAskUserQuestionTool(pi, {
             getChat,
