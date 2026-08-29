@@ -18,20 +18,18 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 ### Herdr Telegram Ask (`herdr-telegram-ask.ts`)
 
-> **Status: M1 (notify-only).** Two-way answering (buttons, remote answers) is
-> planned as M2 — see the plan link in the repo memory notes.
+For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Telegram** — or at the terminal, whichever answers first. When a question opens you get a rich message (questions with numbered options, host/project/session); tapping an option or replying with text answers it remotely (`✅ answered via Telegram`), answering at the terminal edits the message to `⌨️ answered at the terminal`. Inert unless pi runs under Herdr (`HERDR_ENV=1`).
 
-For [Herdr](https://herdr.dev) users: while pi has an `ask_user_question` open,
-you get a rich Telegram message — the actual questions with numbered options,
-plus host, project folder and session name — and a ✅ edit (with the answer)
-when the question resolves. Inert unless pi runs under Herdr (`HERDR_ENV=1`),
-like `herdr-blocked-on-question`.
+**How it works:** pi's `ask_user_question` is itself an extension ([`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono)); this extension registers a same-name tool with a byte-compatible contract that races the Telegram wizard against a local dialog. If Telegram is unreachable, it degrades to local-only answering. ADR with the full rationale: see the repo memory notes.
 
 **Setup** (one-time, under Herdr):
 1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
 2. In pi: `/telegram setup` — paste the token, then send `/start` to your bot in Telegram. The chat is discovered automatically; config is saved to `~/.pi/agent/herdr-telegram.json` (0600).
 
-**Commands:** `/telegram status` · `on` · `off` · `test` (send+edit round-trip).
+**Commands:** `/telegram status` · `on` · `off` · `test`.
+
+- Only the configured chat may answer; every other chat is ignored. Free-text replies become custom answers ("Type something." row). multiSelect questions get toggle buttons + `✅ Submit`.
+- `/telegram off` disables remote answering and notifications; run `/reload` afterwards to fully restore the original rpiv tool (until then it falls back to local-only dialogs).
 
 **Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).
 
