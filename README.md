@@ -74,7 +74,7 @@ Colorful statusline showing token usage, context window progress, git branch, an
 ```
 
 **Buttons** (live on the run message; routed through the shared poll hub):
-- `📋 tasks` — the session's todo list (replayed read-only from the last `todo` tool result; ✔ done · ◐ in progress · □ pending) as a toast, or a message when long.
+- `📋 tasks` — the session's todo list (replayed read-only from the last `todo` tool result; ✔ done · ◐ in progress · □ pending): short lists (≤3) as an inline toast, longer lists as a message with **one task per line**.
 - `⏹ stop` — aborts the current agent run (`ctx.abort()`); the settle summary reads `⏹ stopped`.
 - `🔁 refresh` — immediate status edit, bypassing the throttle.
 

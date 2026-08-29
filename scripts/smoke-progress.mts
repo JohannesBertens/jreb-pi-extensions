@@ -327,7 +327,7 @@ ok("progressEnabled requires enabled config", core.progressEnabled({}, cfgPath) 
         },
     };
     let aborted = 0;
-    const todoBranch = [
+    let todoBranchData: unknown[] = [
         { type: "message", message: { role: "toolResult", toolName: "todo", details: { action: "list", nextId: 5, tasks: [
             { id: 1, subject: "research", status: "completed" },
             { id: 2, subject: "writing tests", activeForm: "writing smoke tests", status: "in_progress" },
@@ -335,7 +335,7 @@ ok("progressEnabled requires enabled config", core.progressEnabled({}, cfgPath) 
             { id: 4, subject: "gone", status: "deleted" },
         ] } } },
     ];
-    const t = trackerOf({ pollHub: fakeHub as any, abort: () => { aborted += 1; }, getBranch: () => todoBranch as any, instanceId: "golem:111" });
+    const t = trackerOf({ pollHub: fakeHub as any, abort: () => { aborted += 1; }, getBranch: () => todoBranchData as any, instanceId: "golem:111" });
 
     t.onAgentStart(fakeCtx);
     await flush();
@@ -355,11 +355,25 @@ ok("progressEnabled requires enabled config", core.progressEnabled({}, cfgPath) 
     await flush();
     ok("refresh edits immediately (throttle bypass)", edits.length > editsBefore && JSON.stringify(edits[edits.length - 1].markup).includes("🔁 refresh"), edits.length);
 
-    // tasks: rendered from the branch (activeForm for in_progress, deleted dropped)
+    // tasks: short list (≤3 live) → inline toast; long list → message with line breaks
     ok("tasks claimed", route("p:golem:111:tasks") === true);
     await flush();
     const tasksAck = acks[acks.length - 1];
     ok("tasks toast renders replay", tasksAck.includes("1 ✔ research") && tasksAck.includes("2 ◐ writing smoke tests") && tasksAck.includes("3 □ ship it") && !tasksAck.includes("gone"), tasksAck);
+
+    // 5 live tasks → message, one task per line
+    const sentBeforeTasks = sent.length;
+    todoBranchData = [{ type: "message", message: { role: "toolResult", toolName: "todo", details: { nextId: 6, tasks: [
+        { id: 1, subject: "alpha", status: "pending" },
+        { id: 2, subject: "beta", status: "pending" },
+        { id: 3, subject: "gamma", status: "in_progress", activeForm: "gammating" },
+        { id: 4, subject: "delta", status: "completed" },
+        { id: 5, subject: "epsilon", status: "pending" },
+    ] } } }];
+    ok("long tasks claimed", route("p:golem:111:tasks") === true);
+    await flush();
+    ok("long tasks delivered as message with linebreaks", sent.length === sentBeforeTasks + 1 && sent[sent.length - 1].text.split("\n").some((l) => l.includes("3 ◐ gammating")) && sent[sent.length - 1].text.includes("\n4 ✔ delta\n"), sent[sent.length - 1]);
+    ok("long tasks acked", acks[acks.length - 1] === "📋 tasks");
 
     // stop: abort + stopped flag + ack
     ok("stop claimed + acked", route("p:golem:111:stop") === true && acks[acks.length - 1].includes("stop requested"));
@@ -401,7 +415,8 @@ ok("replay skips malformed details", (() => {
 })());
 ok("replay undefined without todo entries", mod.replayTodoState([] as any) === undefined);
 ok("render no tasks", mod.renderTodoTasks(undefined) === "No tasks yet" && mod.renderTodoTasks([{ id: 1, subject: "gone", status: "deleted" }]) === "No open tasks" && mod.renderTodoTasks([{ id: 1, subject: "x", status: "completed" }]) === "1 ✔ x");
-ok("long task list goes to a message, not a toast", mod.renderTodoTasks(Array.from({ length: 8 }, (_, i) => ({ id: i, subject: `subject-${i}-padpadpadpad`, status: "pending" }))).length > 190);
+ok("render inline vs list", mod.renderTodoTasksInline([{ id: 1, subject: "a", status: "pending" }, { id: 2, subject: "b", status: "pending" }]).includes(" · ") && mod.renderTodoTasks([{ id: 1, subject: "a", status: "pending" }, { id: 2, subject: "b", status: "pending" }]).includes("\n"));
+ok("long task list goes to a message, not a toast", mod.renderTodoTasksInline(Array.from({ length: 8 }, (_, i) => ({ id: i, subject: `subject-${i}-padpadpadpad`, status: "pending" }))).length > 190);
 
 // --- M4: dialog pings ----------------------------------------------------------
 {

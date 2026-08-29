@@ -120,6 +120,14 @@ export interface TodoTask {
     activeForm?: string;
 }
 
+function taskLines(tasks: TodoTask[]): string[] {
+    return tasks.map((t) => {
+        const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "◐" : "□";
+        const text = t.status === "in_progress" && t.activeForm ? t.activeForm : t.subject;
+        return `${t.id} ${mark} ${oneLine(text, 80)}`;
+    });
+}
+
 export function replayTodoState(branch: Iterable<unknown>): TodoTask[] | undefined {
     let result: TodoTask[] | undefined;
     for (const entry of branch) {
@@ -140,13 +148,35 @@ export function renderTodoTasks(tasks: TodoTask[] | undefined): string {
     if (tasks === undefined) return "No tasks yet";
     const live = tasks.filter((t) => t.status !== "deleted");
     if (live.length === 0) return "No open tasks";
-    return live
-        .map((t) => {
-            const mark = t.status === "completed" ? "✔" : t.status === "in_progress" ? "◐" : "□";
-            const text = t.status === "in_progress" && t.activeForm ? t.activeForm : t.subject;
-            return `${t.id} ${mark} ${oneLine(text, 60)}`;
-        })
-        .join(" · ");
+    return taskLines(live).join("\n");
+}
+
+/** Single-line `·`-joined variant — toasts only (they can't render line breaks). */
+export function renderTodoTasksInline(tasks: TodoTask[] | undefined): string {
+    if (tasks === undefined) return "No tasks yet";
+    const live = tasks.filter((t) => t.status !== "deleted");
+    if (live.length === 0) return "No open tasks";
+    return taskLines(live).join(" · ");
+}
+
+/**
+ * Deliver the task list for a button tap: ≤3 tasks that fit the toast limit →
+ * inline toast; anything longer → a message with ONE TASK PER LINE (the
+ * single-line `·` rendering gets unreadable fast — README sample notwithstanding).
+ */
+export function deliverTasks(
+    chat: { client: TelegramClient; chatId: string },
+    callbackQueryId: string,
+    tasks: TodoTask[] | undefined,
+): void {
+    const live = (tasks ?? []).filter((t) => t.status !== "deleted");
+    const inline = renderTodoTasksInline(tasks);
+    if (live.length <= 3 && inline.length <= TOAST_MAX) {
+        chat.client.answerCallbackQuery(callbackQueryId, inline).catch(() => {});
+        return;
+    }
+    chat.client.answerCallbackQuery(callbackQueryId, "📋 tasks").catch(() => {});
+    chat.client.sendMessage(chat.chatId, `<b>📋 tasks</b>\n${escapeHtml(renderTodoTasks(tasks))}`).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -431,13 +461,7 @@ export function createRunTracker(deps: ProgressDeps = {}): RunTracker {
                 return;
             }
             case "tasks": {
-                const text = renderTodoTasks(replayTodoState(branch() ?? []));
-                if (text.length <= TOAST_MAX) {
-                    ack(text);
-                } else {
-                    ack("tasks sent as message");
-                    chat.client.sendMessage(chat.chatId, `<b>📋 tasks</b>\n${escapeHtml(text)}`).catch(() => {});
-                }
+                deliverTasks(chat, cb.id, replayTodoState(branch() ?? []));
                 return;
             }
             default:
@@ -766,13 +790,7 @@ export default function (pi: ExtensionAPI) {
                                 } catch {
                                     /* leave empty */
                                 }
-                                const text = renderTodoTasks(replayTodoState(branch));
-                                if (text.length <= 190) {
-                                    ack(text);
-                                } else {
-                                    ack("tasks sent as message");
-                                    chat.client.sendMessage(chat.chatId, `<b>📋 tasks</b>\n${escapeHtml(text)}`).catch(() => {});
-                                }
+                                deliverTasks(chat, cb.id, replayTodoState(branch));
                             } else if (action === "stop") {
                                 ack("test window — nothing to stop");
                             } else {
