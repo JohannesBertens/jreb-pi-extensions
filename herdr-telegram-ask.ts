@@ -582,6 +582,7 @@ interface RemoteSessionState {
     current: number;
     toggled: Set<number>;
     answers: QuestionAnswer[];
+    startedAt: number;
 }
 
 function currentQuestionline(state: RemoteSessionState): string {
@@ -589,9 +590,16 @@ function currentQuestionline(state: RemoteSessionState): string {
     return `[${state.current + 1}/${state.params.questions.length}] ${q.question}`;
 }
 
+export function formatElapsed(ms: number): string {
+    const secs = Math.max(0, Math.floor(ms / 1000));
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    return `${mins}m${secs % 60 ? ` ${secs % 60}s` : ""}`;
+}
+
 /** Progress block appended to the base message while the wizard is running. */
 export function remoteProgressText(state: RemoteSessionState): string {
-    const lines: string[] = [];
+    const lines: string[] = [`⏳ waiting ${formatElapsed(Date.now() - state.startedAt)}`];
     for (const a of state.answers) {
         lines.push(`✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`);
     }
@@ -626,6 +634,9 @@ export interface RemoteSessionDeps {
     base: string;
     params: QuestionParams;
     signal: AbortSignal;
+    /** Elapsed-edit cadence (default 1 min) and cap (default 30 min) — test knobs. */
+    tickMs?: number;
+    maxElapsedMs?: number;
 }
 
 export interface RemoteSession {
@@ -652,6 +663,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         current: 0,
         toggled: new Set(),
         answers: [],
+        startedAt: Date.now(),
     };
     let resolveResult: ((r: QuestionnaireResult) => void) | undefined;
     const result = new Promise<QuestionnaireResult>((resolve) => {
@@ -661,8 +673,18 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
     let dismissed = false;
     let offset = 0;
 
-    const edit = (text: string, keyboard?: Keyboard) =>
-        client.editMessageText(chatId, state.messageId, text, keyboard ? { inline_keyboard: keyboard } : NO_KEYBOARD).catch(() => {});
+    // Serialize edits: an elapsed edit already in flight must never land after a
+    // later close edit (it would resurrect the keyboard on a resolved message).
+    let editChain: Promise<void> = Promise.resolve();
+    const edit = (text: string, keyboard?: Keyboard): Promise<void> => {
+        editChain = editChain.then(() =>
+            client
+                .editMessageText(chatId, state.messageId, text, keyboard ? { inline_keyboard: keyboard } : NO_KEYBOARD)
+                .then(() => undefined)
+                .catch(() => {}),
+        );
+        return editChain;
+    };
 
     const finishRemote = (): void => {
         settled = true;
@@ -775,6 +797,27 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         }
     };
 
+    // Elapsed-time edits (plan M3): refresh the wait line once per minute while
+    // the question is open, capped so a forgotten question stops nagging. Edits
+    // MUST carry the current keyboard — an editMessageText without reply_markup
+    // would strip the buttons.
+    const tickMs = deps.tickMs ?? 60_000;
+    const maxElapsedMs = deps.maxElapsedMs ?? 30 * 60_000;
+    let elapsedTimer: ReturnType<typeof setInterval> | undefined;
+    const stopElapsed = () => {
+        if (elapsedTimer) clearInterval(elapsedTimer);
+        elapsedTimer = undefined;
+    };
+    if (tickMs > 0) {
+        elapsedTimer = setInterval(() => {
+            if (settled || dismissed || signal.aborted || state.messageId === 0) return stopElapsed();
+            if (Date.now() - state.startedAt >= maxElapsedMs) return stopElapsed();
+            edit(state.base + remoteProgressText(state), buildKeyboard(state));
+        }, tickMs);
+        elapsedTimer.unref?.();
+        signal.addEventListener("abort", stopElapsed, { once: true });
+    }
+
     // Fire the initial message; failures leave `result` pending forever (race then
     // runs local-only) and surface through the caller's notify path.
     client
@@ -783,7 +826,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
             state.messageId = message_id;
             void poll();
         })
-        .catch(() => {});
+        .catch(stopElapsed);
 
     return {
         result,
@@ -880,6 +923,35 @@ export interface ShadowToolDeps {
 }
 
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
+
+// --- rpiv drift detection (ADR-0001: the *tool contract* is not covered by ----
+// --- rpiv's event stability policy — re-diff the clone on upgrades) ----------
+
+/** The rpiv release the clone in this file was taken from. Bump when re-diffing. */
+export const CLONED_RPIV_VERSION = "2.7.1";
+
+const RPIV_PACKAGE_JSON = join(
+    process.env.HOME ?? "~",
+    ".pi/agent/npm/node_modules/@juicesharp/rpiv-ask-user-question/package.json",
+);
+
+export function readInstalledRpivVersion(path: string = RPIV_PACKAGE_JSON): string | undefined {
+    try {
+        const pkg = JSON.parse(readFileSync(path, "utf-8")) as { version?: string };
+        return typeof pkg.version === "string" && pkg.version.length > 0 ? pkg.version : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export function rpivStatusLine(installed: string | undefined): string {
+    if (!installed) {
+        return `rpiv: not found (shadow clone stands alone — cloned from ${CLONED_RPIV_VERSION})`;
+    }
+    return installed === CLONED_RPIV_VERSION
+        ? `rpiv: ${installed} (matches cloned contract ✓)`
+        : `rpiv: ${installed} ⚠️ differs from cloned ${CLONED_RPIV_VERSION} — re-diff the clone (ADR-0001; plan §8b)`;
+}
 
 const ERROR_NO_UI = "Error: UI not available (running in non-interactive mode)";
 
@@ -1143,6 +1215,7 @@ export default function (pi: ExtensionAPI) {
                         `config: ${source}${split ? " (partial env config: set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)" : ""}`,
                         `token: ${config ? "set" : "missing"} · chat: ${config?.chatId ? "set" : "missing"} · enabled: ${config?.enabled ?? false}`,
                         `tool: ${shadowRegistered ? "shadowed — answer via Telegram or terminal" : config?.enabled ? "notify-only (shadow will register on /reload)" : "original rpiv tool untouched"}`,
+                        rpivStatusLine(readInstalledRpivVersion()),
                         `file: ${CONFIG_PATH}`,
                     ];
                     ctx.ui.notify(lines.join("\n"), "info");

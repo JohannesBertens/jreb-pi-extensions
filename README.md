@@ -29,6 +29,8 @@ For [Herdr](https://herdr.dev) users: **answer pi's `ask_user_question` from Tel
 **Commands:** `/telegram status` · `on` · `off` · `test`.
 
 - Only the configured chat may answer; every other chat is ignored. Free-text replies become custom answers ("Type something." row). multiSelect questions get toggle buttons + `✅ Submit`.
+- While a question is open, the message refreshes its `⏳ waiting` line once a minute (stops after 30 min).
+- `/telegram status` also shows the installed rpiv version vs. the contract this extension clones (`2.7.1`) — if they diverge after a `pi update`, re-diff the clone (ADR-0001).
 - `/telegram off` disables remote answering and notifications; run `/reload` afterwards to fully restore the original rpiv tool (until then it falls back to local-only dialogs).
 
 **Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).

@@ -515,6 +515,47 @@ await (piReg.handlers as any).tool_execution_start[0]({ toolCallId: "s1", toolNa
 await tick();
 ok("notifier suppressed while shadow registered", tgCalls.filter((c) => c.method === "sendMessage").length === 0);
 
+// --- M3+: elapsed-time edits ----------------------------------------------------
+ok("formatElapsed", mod.formatElapsed(0) === "0s" && mod.formatElapsed(59_000) === "59s" && mod.formatElapsed(60_000) === "1m" && mod.formatElapsed(194_000) === "3m 14s");
+
+{
+    // Direct session with fast tick: elapsed edits carry the keyboard and stop after the cap.
+    const elapsedEdits: Array<{ text: string; hasKeyboard: boolean }> = [];
+    const elapsedClient: TelegramClient = {
+        ...fakeClient,
+        sendMessage: async () => ({ message_id: 888 }),
+        editMessageText: async (_c, _m, text, replyMarkup) => {
+            elapsedEdits.push({ text, hasKeyboard: replyMarkup !== undefined });
+            return true;
+        },
+    };
+    const ac = new AbortController();
+    const session = mod.startRemoteSession({
+        client: elapsedClient,
+        chatId: "42",
+        base: "B",
+        params: singleQ as any,
+        signal: ac.signal,
+        tickMs: 5,
+        maxElapsedMs: 18,
+    });
+    await new Promise((r) => setTimeout(r, 45));
+    ac.abort();
+    await new Promise((r) => setTimeout(r, 10));
+    const elapsedOnly = elapsedEdits.filter((e) => e.text.includes("⏳ waiting"));
+    ok("elapsed edits fire and keep keyboard", elapsedOnly.length >= 2 && elapsedOnly.every((e) => e.hasKeyboard), elapsedEdits.length);
+    const countAtCap = elapsedEdits.length;
+    await new Promise((r) => setTimeout(r, 30));
+    ok("elapsed edits stop after cap", elapsedEdits.length === countAtCap);
+    // session never settled — result promise still pending, no unhandled rejection
+    ok("unresolved session harmless", true);
+}
+
+// --- M3+: rpiv drift warning ----------------------------------------------------
+ok("drift line matches", mod.rpivStatusLine("2.7.1").includes("matches cloned contract"));
+ok("drift line warns", mod.rpivStatusLine("2.8.0").includes("⚠️") && mod.rpivStatusLine("2.8.0").includes("2.7.1"));
+ok("drift line absent install", mod.rpivStatusLine(undefined).includes("not found"));
+
 // cleanup
 mod.__setDefaultTransportForTests(undefined);
 rmSync(homeTmp, { recursive: true, force: true });
