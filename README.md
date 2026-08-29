@@ -9,9 +9,9 @@ Custom extensions for [pi](https://github.com/earendil-works/pi).
 Colorful statusline showing token usage, context window progress, git branch, and current model.
 
 **Features:**
-- **↑ input / ↓ output** — token counts with colored arrows
-- **Context bar** — visual progress bar with color-coded warning levels (green < 70%, yellow 70-90%, red > 90%)
-- **● branch** — current git branch
+- **↑ input / ↓ output** — cumulative token counts with colored arrows; `R`/`W` show cache read/write totals when the model uses prompt caching (pi-ai's `input` excludes cached tokens)
+- **Context bar** — compaction-aware context estimate from pi core (`ctx.getContextUsage()`), visual progress bar with color-coded warning levels (green < 70%, yellow 70-90%, red > 90%). Shows `?` right after a compaction until the next model response
+- **● branch** — current git branch (± and red when dirty)
 - **model** — active model name
 
 ![footer example](./images/footer.png)
@@ -52,21 +52,21 @@ Overwrites the extension files in `~/.pi/agent/extensions/`, so re-running it up
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-cp custom-footer.ts ~/.pi/agent/extensions/
+cp *.ts ~/.pi/agent/extensions/
 ```
 
 In pi, run:
 1. `/reload` — pick up the new extension
 2. `/footer` — enable the custom footer (toggle off/on with same command)
 
-### Option 2: Symlink from this repo
+### Option 2: Symlink from this repo (dev workflow)
 
 ```bash
 mkdir -p ~/.pi/agent/extensions
-ln -sf ~/Projects/jreb-pi-extensions/custom-footer.ts ~/.pi/agent/extensions/
+for f in ~/projects/jreb-pi-extensions/*.ts; do ln -sfn "$f" ~/.pi/agent/extensions/; done
 ```
 
-Changes to the file are picked up automatically with `/reload`.
+Changes to the files are picked up automatically with `/reload` — no reinstall needed.
 
 ### Configure context window
 
@@ -103,6 +103,16 @@ Known limitations to address later:
   integration) to emit `herdr:blocked` for *all* awaiting-input states, at which
   point this extension becomes redundant.
 
+## Development
+
+The extensions have **no runtime dependencies** — pi loads the `*.ts` files directly (via jiti, which resolves `@earendil-works/*` imports to pi's own running instance). The `package.json` in this repo is dev-only tooling:
+
+```bash
+npm install        # dev-only: typescript + pi packages for typechecking
+npm run typecheck  # strict tsc --noEmit against the real pi API
+npm run smoke      # renders the footer against stubs; verifies segments & toggles
+```
+
 ## License
 
-MIT
+[MIT](./LICENSE)
