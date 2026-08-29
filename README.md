@@ -16,6 +16,27 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 ![footer example](./images/footer.png)
 
+### Herdr Telegram Ask (`herdr-telegram-ask.ts`)
+
+> **Status: M1 (notify-only).** Two-way answering (buttons, remote answers) is
+> planned as M2 — see the plan link in the repo memory notes.
+
+For [Herdr](https://herdr.dev) users: while pi has an `ask_user_question` open,
+you get a rich Telegram message — the actual questions with numbered options,
+plus host, project folder and session name — and a ✅ edit (with the answer)
+when the question resolves. Inert unless pi runs under Herdr (`HERDR_ENV=1`),
+like `herdr-blocked-on-question`.
+
+**Setup** (one-time, under Herdr):
+1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
+2. In pi: `/telegram setup` — paste the token, then send `/start` to your bot in Telegram. The chat is discovered automatically; config is saved to `~/.pi/agent/herdr-telegram.json` (0600).
+
+**Commands:** `/telegram status` · `on` · `off` · `test` (send+edit round-trip).
+
+**Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).
+
+**Privacy:** question content and answers transit Telegram's cloud. That is the point of the tool — but it is opt-in per the config above.
+
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 
 > **Status: provisional** — a stopgap companion to the Herdr-managed
