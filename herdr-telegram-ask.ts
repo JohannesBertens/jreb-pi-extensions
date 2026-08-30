@@ -222,6 +222,16 @@ export type QuestionnaireError =
 export interface QuestionnaireResult {
     answers: QuestionAnswer[];
     cancelled: boolean;
+    /**
+     * Global note authored after the last question of a multi-question ask
+     * (upstream: the Submit tab's `n` editor). Attached on both submit and
+     * cancel. Conditional-spread contract, mirroring `QuestionAnswer.notes`:
+     * the key appears only via conditional spread of a non-empty (trimmed at
+     * commit) string — never assigned `undefined`, never kept for an
+     * empty/whitespace-only draft — so note-free results stay byte-identical
+     * (`!("globalNote" in result)` holds).
+     */
+    globalNote?: string;
     error?: QuestionnaireError;
 }
 
@@ -289,12 +299,25 @@ function buildAnswerSegment(a: QuestionAnswer): string {
 
 export function buildQuestionnaireResponse(result: QuestionnaireResult | null | undefined, params: QuestionParams) {
     if (!result || result.cancelled) {
-        return buildToolResult(DECLINE_MESSAGE, { answers: result?.answers ?? [], cancelled: true });
+        // Decline text stays canonical even when a global note rides the cancelled result;
+        // the note survives in `details` (like partial `answers`) for replay consumers.
+        return buildToolResult(DECLINE_MESSAGE, {
+            answers: result?.answers ?? [],
+            cancelled: true,
+            ...(result?.globalNote && result.globalNote.length > 0 ? { globalNote: result.globalNote } : {}),
+        });
     }
     const segments: string[] = [];
     for (let i = 0; i < params.questions.length; i++) {
         const a = result.answers.find((x) => x.questionIndex === i);
         if (a) segments.push(buildAnswerSegment(a));
+    }
+    // Global note rides after the per-question segments: raw multiline echo (no
+    // reformatting), trailing period mirroring `buildAnswerSegment`'s shape.
+    // Pushed BEFORE the zero-segments check — a note-bearing submit with zero
+    // answers still yields the answered envelope.
+    if (result.globalNote && result.globalNote.length > 0) {
+        segments.push(`global note: ${result.globalNote}.`);
     }
     if (segments.length === 0) {
         return buildToolResult(DECLINE_MESSAGE, { answers: result.answers, cancelled: true });
@@ -353,10 +376,17 @@ interface RemoteSessionState {
     messageId: number;
     base: string;
     params: QuestionParams;
+    /** Current question index; === questions.length in review mode (upstream's Submit-tab pseudo-index). */
     current: number;
     toggled: Set<number>;
     answers: QuestionAnswer[];
+    /** Global note draft (review mode). Trimmed; undefined/"" = none — mirrors upstream's notesByTab commit contract. */
+    note: string | undefined;
     startedAt: number;
+}
+
+function inReview(state: RemoteSessionState): boolean {
+    return state.current >= state.params.questions.length;
 }
 
 function currentQuestionline(state: RemoteSessionState): string {
@@ -374,6 +404,14 @@ export function remoteProgressText(state: RemoteSessionState): string {
     for (const a of state.answers) {
         lines.push(`✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`);
     }
+    if (inReview(state)) {
+        // Review & submit — mirrors upstream's multi-question Submit tab (the
+        // single place the global note is authored; free-text replies edit it).
+        if (state.note) lines.push(`📝 note: ${escapeHtml(oneLine(state.note, 120))}`);
+        lines.push(`▶️ <b>Review — all questions answered</b>`);
+        lines.push(`<i>reply with text to add a note · tap ✓ Submit when done</i>`);
+        return `\n\n${lines.join("\n")}`;
+    }
     lines.push(`▶️ <b>Now answering:</b> ${escapeHtml(oneLine(currentQuestionline(state), 120))}`);
     if (state.params.questions[state.current].multiSelect) {
         const picked = [...state.toggled].map((i) => state.params.questions[state.current].options[i].label);
@@ -384,10 +422,16 @@ export function remoteProgressText(state: RemoteSessionState): string {
     return `\n\n${lines.join("\n")}`;
 }
 
-/** Inline keyboard for the current question. */
+/** Inline keyboard for the current question (or the review/submit step). */
 export function buildKeyboard(state: RemoteSessionState): Keyboard {
-    const q = state.params.questions[state.current];
     const rows: Keyboard = [];
+    if (inReview(state)) {
+        if (state.note) rows.push([{ text: "🗑 Clear note", callback_data: `${state.nonce}:clr` }]);
+        rows.push([{ text: "✓ Submit", callback_data: `${state.nonce}:sub` }]);
+        rows.push([{ text: "✕ Leave for terminal", callback_data: `${state.nonce}:x` }]);
+        return rows;
+    }
+    const q = state.params.questions[state.current];
     q.options.forEach((o, i) => {
         const mark = q.multiSelect && state.toggled.has(i) ? "✓ " : "";
         rows.push([{ text: `${mark}${i + 1} · ${oneLine(o.label, 56)}`, callback_data: `${state.nonce}:${i}` }]);
@@ -436,6 +480,7 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         current: 0,
         toggled: new Set(),
         answers: [],
+        note: undefined,
         startedAt: Date.now(),
     };
     let resolveResult: ((r: QuestionnaireResult) => void) | undefined;
@@ -468,15 +513,22 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         settled = true;
         releasePoll();
         const summary = state.answers.map((a) => `✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`);
+        if (state.note) summary.push(`📝 ${escapeHtml(oneLine(state.note, 120))}`);
         edit(`${state.base}\n\n${summary.join("\n")}\n\n<b>✅ answered via Telegram</b>`);
-        resolveResult?.({ answers: state.answers, cancelled: false });
+        resolveResult?.({
+            answers: state.answers,
+            cancelled: false,
+            ...(state.note && state.note.length > 0 ? { globalNote: state.note } : {}),
+        });
     };
 
     const advance = (answer: QuestionAnswer): void => {
         state.answers.push(answer);
         state.current += 1;
         state.toggled.clear();
-        if (state.current >= params.questions.length) {
+        if (inReview(state) && params.questions.length === 1) {
+            // Single-question asks finish immediately (upstream has no Submit
+            // tab without isMulti — hence no note affordance either).
             finishRemote();
         } else {
             edit(state.base + remoteProgressText(state), buildKeyboard(state));
@@ -519,6 +571,11 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
             return;
         }
         if (rest === "sub") {
+            if (inReview(state)) {
+                ack("submitted");
+                finishRemote();
+                return;
+            }
             const q = params.questions[state.current];
             ack("submitted");
             advance({
@@ -530,12 +587,23 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
             });
             return;
         }
+        if (rest === "clr") {
+            if (!inReview(state)) {
+                ack();
+                return;
+            }
+            state.note = undefined;
+            ack("note cleared");
+            edit(state.base + remoteProgressText(state), buildKeyboard(state));
+            return;
+        }
+        const q = params.questions[state.current];
         const optIdx = Number(rest);
-        if (!Number.isInteger(optIdx) || optIdx < 0 || optIdx >= params.questions[state.current].options.length) {
+        if (!q || !Number.isInteger(optIdx) || optIdx < 0 || optIdx >= q.options.length) {
             ack();
             return;
         }
-        ack(`✓ ${oneLine(params.questions[state.current].options[optIdx].label, 40)}`);
+        ack(`✓ ${oneLine(q.options[optIdx].label, 40)}`);
         answerOption(optIdx);
     };
 
@@ -544,6 +612,14 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
         const text = (msg.text ?? "").trim();
         if (!text || text.startsWith("/")) return;
         if (settled || dismissed) return;
+        if (inReview(state)) {
+            // Review mode: free text becomes/updates the global note (upstream's
+            // Submit-tab `n` editor equivalent; commits are trimmed, empty deletes).
+            const note = text.trim();
+            state.note = note.length > 0 ? note : undefined;
+            edit(state.base + remoteProgressText(state), buildKeyboard(state));
+            return;
+        }
         // Free text = custom answer for the current question (replaces multi toggles).
         const q = params.questions[state.current];
         advance({ questionIndex: state.current, question: q.question, kind: "custom", answer: text });
@@ -661,6 +737,8 @@ export function startRemoteSession(deps: RemoteSessionDeps): RemoteSession {
 
 const LOCAL_CUSTOM = "Type something…";
 const LOCAL_DONE = "✓ Done";
+const LOCAL_SUBMIT = "✓ Submit";
+const LOCAL_NOTE = "✎ Add note";
 
 export async function runLocalWalker(
     ctx: ExtensionContext,
@@ -719,7 +797,24 @@ export async function runLocalWalker(
             ...(typeof q.options[idx].preview === "string" && q.options[idx].preview ? { preview: q.options[idx].preview } : {}),
         });
     }
-    return { answers, cancelled: false };
+    // Global-note step — mirrors upstream's multi-question Submit tab: single-
+    // question asks finish immediately, multi-question asks get one review
+    // prompt (upstream's `n`-editor equivalent). Esc on the prompt cancels the
+    // whole questionnaire (like Esc on the Submit tab); Esc in the note input
+    // merely discards the note — the questionnaire still submits.
+    let globalNote: string | undefined;
+    if (params.questions.length > 1) {
+        const pick = await ctx.ui.select("All questions answered — add a note?", [LOCAL_SUBMIT, LOCAL_NOTE], { signal });
+        if (pick === undefined) return cancel();
+        if (pick === LOCAL_NOTE) {
+            const text = await ctx.ui.input("Note covering all answers", undefined, { signal });
+            if (signal.aborted) return cancel();
+            // Esc (undefined) closes the editor without a note — the questionnaire still submits.
+            const trimmed = (text ?? "").trim();
+            if (trimmed.length > 0) globalNote = trimmed;
+        }
+    }
+    return { answers, cancelled: false, ...(globalNote ? { globalNote } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -842,9 +937,12 @@ export function buildAskUserQuestionTool(pi: ExtensionAPI, deps: AskUserQuestion
                 }
                 if (winner.kind === "local") {
                     remote?.settledRemotely(
-                        winner.result.answers.map(
-                            (a) => `✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`,
-                        ),
+                        [
+                            ...winner.result.answers.map(
+                                (a) => `✅ ${escapeHtml(oneLine(a.question, 60))} → ${escapeHtml(oneLine(formatAnswerScalar(a), 80))}`,
+                            ),
+                            ...(winner.result.globalNote ? [`📝 ${escapeHtml(oneLine(winner.result.globalNote, 120))}`] : []),
+                        ],
                         winner.result.cancelled ? "declined" : "answered",
                     );
                     return buildQuestionnaireResponse(winner.result, params);

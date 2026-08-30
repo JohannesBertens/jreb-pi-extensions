@@ -37,6 +37,7 @@ Colorful statusline showing token usage, context window progress, git branch, an
 **Commands:** `/telegram status` · `on` · `off` · `test`.
 
 - Only the configured chat may answer; every other chat is ignored. Free-text replies become custom answers ("Type something." row). multiSelect questions get toggle buttons + `✅ Submit`.
+- **Multi-question asks end in a review step** (mirroring upstream's Submit tab, single-question asks submit immediately): after the last answer the phone shows `✓ Submit` + `✕ Leave for terminal` — reply with text (or the terminal walker's `✎ Add note`) to attach a **global note** that rides the envelope as `global note: …` and survives declines in `details`. `🗑 Clear note` removes it. Per-question `user notes:` are echoed by the envelope when present (upstream authors them via its full-screen TUI; our lean dialogs don't — known divergence).
 - While a question is open, the message refreshes its `⏳ waiting` line once a minute (stops after 30 min).
 - `/telegram status` shows the upstream-vs-clone drift hint (see **Drift duty** above) plus config/tool state.
 - `/telegram off` disables remote answering immediately — the tool stays registered and serves local-only dialogs from the next question on. No `/reload` needed.
@@ -59,6 +60,7 @@ Colorful statusline showing token usage, context window progress, git branch, an
 8. **Network loss** — go offline mid-question → terminal answering unaffected; the open Telegram message simply never gets its ✅ edit, and later taps on it spin out (polling already stopped) — expected.
 9. **Herdr readout** — while a question is open, the Herdr pane shows red/blocked (the sibling `herdr-blocked-on-question` extension tracks the tool by name and keeps working).
 10. **Sanity** — `/telegram status` shows `tool: ask_user_question owned by this file`; `/telegram test` send+edit round-trips.
+11. **Global note** — a 2+ question ask → after the last answer the phone shows the review step; reply with text (note shown as `📝 note:`), `🗑 Clear note`, then re-note and `✓ Submit` → envelope ends with `global note: <text>.`; at the terminal the same ask offers `✓ Submit` / `✎ Add note` after the last question.
 
 ### Herdr Telegram Progress (`herdr-telegram-progress.ts` + `herdr-telegram-core.ts`)
 

@@ -236,6 +236,30 @@ ok(
         .content[0].text.includes("selected preview: P"),
 );
 
+// --- globalNote (rpiv 2.7.1+ Submit-tab note; envelope clone) -----------------
+const oneQParams = { questions: [mkQ("Q?")] } as any;
+ok(
+    "envelope global note segment",
+    mod.buildQuestionnaireResponse(
+        { answers: [{ questionIndex: 0, question: "Q?", kind: "option", answer: "a" }], cancelled: false, globalNote: "ship it" },
+        oneQParams,
+    ).content[0].text === 'User has answered your questions: "Q?"="a". global note: ship it. You can now continue with the user\'s answers in mind.',
+);
+ok(
+    "envelope note-only submit answers",
+    mod.buildQuestionnaireResponse({ answers: [], cancelled: false, globalNote: "only a note" }, oneQParams).content[0].text ===
+        "User has answered your questions: global note: only a note. You can now continue with the user's answers in mind.",
+);
+const declinedNote = mod.buildQuestionnaireResponse(
+    { answers: [{ questionIndex: 0, question: "Q?", kind: "option", answer: "a" }], cancelled: true, globalNote: "kept anyway" },
+    oneQParams,
+);
+ok("envelope decline keeps note in details", declinedNote.content[0].text === "User declined to answer questions" && declinedNote.details.globalNote === "kept anyway");
+ok(
+    "note-free result byte-identical",
+    !("globalNote" in mod.buildQuestionnaireResponse({ answers: [{ questionIndex: 0, question: "Q?", kind: "option", answer: "a" }], cancelled: false }, oneQParams).details),
+);
+
 // --- M2: shadow tool end-to-end (remote/local race, offline transport) --------
 let nextMsgId = 500;
 let nextUid = 1000;
@@ -327,6 +351,68 @@ updateQueue.push(msgUpdate("do it live"));
 r = await settle(p);
 ok("remote free-text custom", r.content[0].text.includes('"Deploy?"="do it live"'), r.content[0].text);
 
+// multi-question wizard: review step + global note (upstream Submit-tab mirror).
+// NOTE: the shared hub paces empty getUpdates at 250 ms, so each pushed update
+// needs a slow tick (~300 ms) to be fetched, dispatched, and reflected in edits.
+const slowTick = () => new Promise((r) => setTimeout(r, 300));
+const twoQ = {
+    questions: [
+        { question: "First?", header: "A", options: [{ label: "a1", description: "" }, { label: "a2", description: "" }] },
+        { question: "Second?", header: "B", options: [{ label: "b1", description: "" }, { label: "b2", description: "" }] },
+    ],
+};
+p = toolDef.execute("t-note", twoQ, undefined, undefined, makeExecCtx(hangingSelect));
+await tick();
+const nn = keyboardNonce.value;
+updateQueue.push(cbUpdate(`${nn}:0`)); // First? → a1, advances to Second?
+await slowTick();
+updateQueue.push(cbUpdate(`${nn}:1`)); // Second? → b2 → review state
+await slowTick();
+ok(
+    "review state shown after last answer",
+    tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("Review — all questions answered") && c.body.text.includes("reply with text to add a note")),
+);
+ok(
+    "review keyboard offers submit",
+    tgCalls.some(
+        (c) =>
+            c.method === "editMessageText" &&
+            c.body.text.includes("Review — all questions answered") &&
+            (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b: any) => b.text === "✓ Submit"),
+    ),
+);
+updateQueue.push(msgUpdate("  ship on friday  ")); // free text in review = note (trimmed)
+await slowTick();
+ok(
+    "review free text sets trimmed note",
+    tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("📝 note: ship on friday")),
+);
+ok(
+    "note present → clear button",
+    tgCalls.some(
+        (c) =>
+            c.method === "editMessageText" &&
+            c.body.text.includes("📝 note: ship on friday") &&
+            (c.body.reply_markup?.inline_keyboard ?? []).flat().some((b: any) => b.text === "🗑 Clear note"),
+    ),
+);
+updateQueue.push(cbUpdate(`${nn}:clr`)); // clear the note
+await slowTick();
+const reviewEdits = tgCalls.filter((c) => c.method === "editMessageText" && c.body.text.includes("Review — all questions answered"));
+ok("clr removes note + button", reviewEdits.length > 0 && !reviewEdits[reviewEdits.length - 1].body.text.includes("📝 note:"));
+updateQueue.push(cbUpdate(`${nn}:0`)); // numeric tap in review is ignored (no crash)
+await slowTick();
+updateQueue.push(msgUpdate("final note"));
+await slowTick();
+updateQueue.push(cbUpdate(`${nn}:sub`)); // submit from review
+r = await settle(p);
+ok(
+    "remote note envelope",
+    r.content[0].text.includes('"First?"="a1". "Second?"="b2". global note: final note.') && r.details.globalNote === "final note",
+    r.content[0].text,
+);
+ok("remote finish edit shows note", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("📝 final note") && c.body.text.includes("✅ answered via Telegram")));
+
 // stale nonce + foreign chat ignored, then a valid tap still works
 p = toolDef.execute("t4", singleQ, undefined, undefined, makeExecCtx(hangingSelect));
 await tick();
@@ -355,6 +441,39 @@ resolveLocal?.(undefined); // Esc on first question
 r = await settle(p);
 ok("local cancel declines", r.content[0].text === "User declined to answer questions" && r.details.cancelled === true);
 ok("local cancel edits ✖ declined", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("✖ declined at the terminal")));
+
+// local walker: multi-question note step (Submit-tab mirror)
+const walkerNoteCtx = {
+    hasUI: true,
+    cwd: "/x",
+    ui: { select: manualSelect, input: async () => "  walker note  ", notify: () => {} },
+    sessionManager: { getSessionName: () => "smoke" },
+};
+p = toolDef.execute("w-note", twoQ, undefined, undefined, walkerNoteCtx);
+await tick();
+resolveLocal?.("a1"); // First?
+await tick();
+resolveLocal?.("b1"); // Second?
+await tick();
+resolveLocal?.("✎ Add note"); // note offer
+r = await settle(p);
+ok(
+    "walker note envelope (trimmed)",
+    r.content[0].text.includes('"First?"="a1". "Second?"="b1". global note: walker note.') && r.details.globalNote === "walker note",
+    r.content[0].text,
+);
+ok("walker local win shows note at terminal edit", tgCalls.some((c) => c.method === "editMessageText" && c.body.text.includes("📝 walker note") && c.body.text.includes("answered at the terminal")));
+
+// walker: declining the note offer stays byte-identical (no globalNote key)
+p = toolDef.execute("w-noNote", twoQ, undefined, undefined, makeExecCtx(manualSelect));
+await tick();
+resolveLocal?.("a2"); // First?
+await tick();
+resolveLocal?.("b2"); // Second?
+await tick();
+resolveLocal?.("✓ Submit"); // note offer → no note
+r = await settle(p);
+ok("walker no-note result byte-identical", !("globalNote" in r.details) && r.content[0].text.includes('"First?"="a2"'), r.details);
 
 // agent abort mid-question → decline + ⚪ close on telegram
 const acAbort = new AbortController();
