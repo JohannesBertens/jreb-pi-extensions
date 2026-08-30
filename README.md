@@ -127,6 +127,33 @@ mini-ai — Herdr roster · 2 agents · 1 blocked · 1 working
 5. Outside Herdr (plain terminal) → clean `not running under Herdr` error.
 6. After `herdr server stop` (careful — stops your panes' supervisor) or on a machine without Herdr → unreachable error, never a hang or stack trace.
 
+### Herdr Telegram Command (`herdr-telegram-command.ts`)
+
+**Impromptu control of a pi session from Telegram** — steer the running agent,
+queue a follow-up, or abort, from your phone. Self-steering uses pi's
+first-class in-process API (`pi.sendUserMessage` with `deliverAs:
+"steer" | "followUp"`) — no terminal injection. Cross-pane steering and
+spawning new agents (`/steer <pane>`, `/read`, `/keys`, `/new`) arrive with
+Herdr socket control (M2/M3).
+
+- **Slash commands** (work in every session with this file loaded):
+  `/steer <text>` (redirect mid-run) · `/followup`/`/queue <text>` (deliver
+  after current work) · `/stop` (abort the run) · `/help` · `/rc on|off|status`.
+- **Plain text** = steering, but only for the **elected controller session**
+  (`/rc on`): one session at a time hears free-text messages (heartbeat file
+  `~/.pi/agent/herdr-telegram-controller.json`, 10 s beat / 30 s takeover).
+  While `ask_user_question` is open, the wizard owns plain text — answers
+  always win over steering.
+- `/rc on` also exists as a TUI command (same election state); `/telegram off`
+  remains the global kill switch.
+
+**Privacy:** steering text transits Telegram (same as all herdr-telegram-*
+traffic); the messages themselves land in your session transcript as user
+messages.
+
+**Smoke:** `node --experimental-strip-types scripts/smoke-command.mts`
+(offline: parse table, controller election, claim precedence, dispatch modes).
+
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 
 > **Status: provisional** — a stopgap companion to the Herdr-managed

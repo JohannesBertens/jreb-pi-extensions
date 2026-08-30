@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "smoke": "node --experimental-strip-types scripts/smoke-footer.mts && node --experimental-strip-types scripts/smoke-telegram.mts && node --experimental-strip-types scripts/smoke-progress.mts && node --experimental-strip-types scripts/smoke-agents.mts"
+    "smoke": "node --experimental-strip-types scripts/smoke-footer.mts && node --experimental-strip-types scripts/smoke-telegram.mts && node --experimental-strip-types scripts/smoke-progress.mts && node --experimental-strip-types scripts/smoke-agents.mts && node --experimental-strip-types scripts/smoke-command.mts"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.84.4",
