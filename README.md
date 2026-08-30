@@ -102,6 +102,31 @@ Colorful statusline showing token usage, context window progress, git branch, an
 8. **Concurrent sessions** — runs in two pi processes → both tracked; cross-taps answer `owned by …`.
 9. **Sanity** — `/progress status` shows enabled/instance/poll-hub state; `/progress test` round-trips buttons.
 
+### Herdr Agent List (`herdr-agent-list.ts`)
+
+**`/agents` — a roster of every recognized agent in the local [Herdr](https://herdr.dev) instance**, read straight from Herdr's Unix-socket API (`agent.list`, the same JSON-RPC the Herdr-managed pi integration speaks — read direction instead of write). No subprocess, 2 s timeout, zero runtime deps.
+
+```
+mini-ai — Herdr roster · 2 agents · 1 blocked · 1 working
+  ● blocked  pi     /home/johannes/projects/jreb-pi-extensions  wA:p1 ← you
+  ◐ working  pi     blog-site                               wB:p1 (focused)
+```
+
+- **Attention-sorted:** `● blocked` → `◐ working` → `✓ done` → `· idle` → `? unknown` (all agent kinds — pi, codex, claude …; `done` = finished background work you haven't seen yet). `← you` marks the invoking pane, `(focused)` the focused one.
+- **cwd** shows the basename; if two agents share a basename, full paths are shown instead.
+- **Telegram push:** when the Telegram bridge is configured and enabled, the roster is also sent to your chat (one message per `/agents` — explicit command, so audible). Push failure only adds a warning; the TUI roster always renders. `/telegram off` is honored (config re-read per call).
+- **Outside Herdr** (no `HERDR_SOCKET_PATH`, no default socket) the command errors clearly instead of guessing. A dead server surfaces as `Herdr socket unreachable — check \`herdr status\``.
+- **Scope is the local instance by decision** (ADR-0003): Herdr has no cross-machine discovery. The verified SSH fan-out design for a future multi-PC roster lives in the memory bank (`research/herdr-multi-instance.md`).
+
+**Manual E2E checklist** (~2 min, under Herdr):
+
+1. `/agents` in a Herdr pane → roster lists every agent with state glyphs; your pane carries `← you`.
+2. Start/answer something in another pane → re-run `/agents`; states and sort order update.
+3. Two agents in same-named dirs → full paths shown.
+4. `/telegram off` → `/agents` sends nothing to Telegram; `/telegram on` → roster message arrives.
+5. Outside Herdr (plain terminal) → clean `not running under Herdr` error.
+6. After `herdr server stop` (careful — stops your panes' supervisor) or on a machine without Herdr → unreachable error, never a hang or stack trace.
+
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 
 > **Status: provisional** — a stopgap companion to the Herdr-managed
