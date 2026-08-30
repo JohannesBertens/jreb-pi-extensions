@@ -22,9 +22,9 @@ Colorful statusline showing token usage, context window progress, git branch, an
 
 **This file is the provider-of-record for `ask_user_question`** (ADR-0002): it registers the tool unconditionally on load, everywhere — no Herdr required. Without a Telegram config (or after `/telegram off`) it is simply the local questionnaire, byte-compatible with the upstream tool. If you previously installed the npm package `@juicesharp/rpiv-ask-user-question`, **remove it** (`pi remove npm:@juicesharp/rpiv-ask-user-question`) — alongside this file it can only produce a duplicate-tool warning banner and lose.
 
-**How it works:** the tool contract is a frozen, byte-compatible clone of [`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono) `2.7.1`; the handler races the Telegram wizard against a local dialog. If Telegram is unreachable, it degrades to local-only answering. ADR with the full rationale: see the repo memory notes.
+**How it works:** the tool contract is a frozen, byte-compatible clone of [`@juicesharp/rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono) `2.8.0`; the handler races the Telegram wizard against a local dialog. If Telegram is unreachable, it degrades to local-only answering. ADR with the full rationale: see the repo memory notes.
 
-> **⚠️ Drift duty — check upstream periodically.** The clone is frozen at rpiv `2.7.1` and upstream is not installed, so nothing warns you automatically. Run
+> **⚠️ Drift duty — check upstream periodically.** The clone is frozen at rpiv `2.8.0` and upstream is not installed, so nothing warns you automatically. Run
 > ```sh
 > npm view @juicesharp/rpiv-ask-user-question version
 > ```

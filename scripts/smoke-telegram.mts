@@ -448,8 +448,8 @@ ok("formatElapsed", mod.formatElapsed(0) === "0s" && mod.formatElapsed(59_000) =
 }
 
 // --- M3+: rpiv drift warning ----------------------------------------------------
-ok("drift line matches", mod.rpivStatusLine("2.7.1").includes("matches clone 2.7.1") && mod.rpivStatusLine("2.7.1").includes("remove the package"));
-ok("drift line warns", mod.rpivStatusLine("2.8.0").includes("⚠️") && mod.rpivStatusLine("2.8.0").includes("2.7.1") && mod.rpivStatusLine("2.8.0").includes("re-diff"));
+ok("drift line matches", mod.rpivStatusLine(mod.CLONED_RPIV_VERSION).includes(`matches clone ${mod.CLONED_RPIV_VERSION}`) && mod.rpivStatusLine(mod.CLONED_RPIV_VERSION).includes("remove the package"));
+ok("drift line warns", mod.rpivStatusLine("0.0.0").includes("⚠️") && mod.rpivStatusLine("0.0.0").includes(mod.CLONED_RPIV_VERSION) && mod.rpivStatusLine("0.0.0").includes("re-diff"));
 ok("drift line absent install", mod.rpivStatusLine(undefined).includes("upstream not installed") && mod.rpivStatusLine(undefined).includes("drift check"));
 
 // cleanup

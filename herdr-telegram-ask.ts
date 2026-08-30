@@ -4,14 +4,14 @@
  *
  * This file owns the tool outright: it registers `ask_user_question`
  * unconditionally at load — a byte-compatible clone of the contract from the
- * npm package @juicesharp/rpiv-ask-user-question 2.7.1. That package must NOT
+ * npm package @juicesharp/rpiv-ask-user-question 2.8.0. That package must NOT
  * be installed alongside this file (pi flags the duplicate tool name; the
  * package would only conflict and lose). The handler races a Telegram
  * inline-keyboard wizard against the local terminal — first definitive answer
  * wins. Without a Telegram config (or after `/telegram off`) it degrades to
  * local-only, which behaves exactly like the upstream tool.
  *
- * Drift duty (ADR-0002): the clone is frozen at rpiv 2.7.1. Check
+ * Drift duty (ADR-0002): the clone is frozen at rpiv 2.8.0. Check
  * `npm view @juicesharp/rpiv-ask-user-question version` periodically; on a
  * newer release, re-diff the clone (schema/validator/envelope/meta) and bump
  * CLONED_RPIV_VERSION.
@@ -132,7 +132,7 @@ export function renderQuestionnaireMessage(input: RenderInput): string {
 
 // ---------------------------------------------------------------------------
 // The ask_user_question tool — rpiv contract clone (provenance: plan §8(b),
-// rpiv 2.7.1). This file is the SOLE provider of the tool (ADR-0002); the
+// rpiv 2.8.0). This file is the SOLE provider of the tool (ADR-0002); the
 // upstream npm package is intentionally not installed. The contract below is
 // a frozen, byte-compatible clone so the model sees the exact upstream tool.
 // The package is not importable from a file extension — hence the clone.
@@ -740,7 +740,7 @@ export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
 // --- re-diff the clone when upstream releases) --------------------------------
 
 /** The rpiv release the clone in this file was taken from. Bump when re-diffing. */
-export const CLONED_RPIV_VERSION = "2.7.1";
+export const CLONED_RPIV_VERSION = "2.8.0";
 
 const RPIV_PACKAGE_JSON = join(
     process.env.HOME ?? "~",
