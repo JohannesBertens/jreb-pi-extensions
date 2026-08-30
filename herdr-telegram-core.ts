@@ -71,6 +71,20 @@ export interface TelegramClient {
     editMessageText(chatId: string, messageId: number, text: string, replyMarkup?: unknown): Promise<boolean>;
     answerCallbackQuery(callbackQueryId: string, text?: string): Promise<boolean>;
     getUpdates(offset: number, timeoutSec: number, signal: AbortSignal): Promise<TelegramUpdate[]>;
+    getMyCommands(scope?: BotCommandScope): Promise<BotCommand[]>;
+    deleteMyCommands(scope?: BotCommandScope): Promise<boolean>;
+}
+
+/** One entry of the bot's "/" command menu (core.telegram.org/bots/api#botcommand). */
+export interface BotCommand {
+    command: string;
+    description: string;
+}
+
+/** The command-menu scopes we manage (core.telegram.org/bots/api#botcommandscope). */
+export interface BotCommandScope {
+    type: "default" | "all_private_chats" | "all_group_chats" | "chat";
+    chat_id?: string | number;
 }
 
 export interface SendMessageOpts {
@@ -127,6 +141,9 @@ export function createTelegramClient(botToken: string, transport: Transport = cu
             }).then(() => true),
         getUpdates: (offset, timeoutSec, signal) =>
             call("getUpdates", { offset, timeout: timeoutSec, allowed_updates: ["message", "callback_query"] }, signal),
+        getMyCommands: (scope) => call("getMyCommands", { ...(scope ? { scope } : {}) }),
+        deleteMyCommands: (scope) =>
+            call<{ boolean: boolean }>("deleteMyCommands", { ...(scope ? { scope } : {}) }).then(() => true),
     };
 }
 

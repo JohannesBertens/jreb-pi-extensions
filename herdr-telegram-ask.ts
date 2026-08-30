@@ -35,6 +35,7 @@ import {
     oneLine,
     readConfigFile,
     writeConfigFile,
+    type BotCommandScope,
     type PollHub,
     type PollLease,
     type TelegramClient,
@@ -998,7 +999,7 @@ export default function (pi: ExtensionAPI) {
     );
 
     pi.registerCommand("telegram", {
-        description: "Telegram bridge for ask_user_question: setup, status, on/off, test",
+        description: "Telegram bridge for ask_user_question: setup, status, on/off, test, commands",
         handler: async (args: string, ctx) => {
             const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
             switch (sub) {
@@ -1050,6 +1051,45 @@ export default function (pi: ExtensionAPI) {
                         ctx.ui.notify("Test message sent and edited — check Telegram.", "info");
                     } catch (err) {
                         ctx.ui.notify(`telegram test failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+                    }
+                    return;
+                }
+                case "commands": {
+                    const { config } = loadConfig();
+                    if (!config || !config.enabled) {
+                        ctx.ui.notify("Telegram not configured/enabled — run /telegram setup.", "error");
+                        return;
+                    }
+                    const client = createTelegramClient(config.botToken);
+                    const action = args.trim().split(/\s+/)[1]?.toLowerCase() ?? "";
+                    try {
+                        if (action === "reset") {
+                            // The bot's "/" menu is server-side state at Telegram —
+                            // any tool that ever shared this token (e.g. OpenClaw)
+                            // may have registered commands there. Clear every scope
+                            // we can address; deleting an unset scope is a no-op.
+                            const scopes: Array<BotCommandScope> = [
+                                { type: "default" },
+                                { type: "all_private_chats" },
+                                { type: "all_group_chats" },
+                                { type: "chat", chat_id: config.chatId },
+                            ];
+                            for (const scope of scopes) await client.deleteMyCommands(scope);
+                            ctx.ui.notify(
+                                "Bot command menu cleared (default · private · group · this chat). Telegram apps may cache the old list briefly — reopen the chat if it lingers.",
+                                "info",
+                            );
+                            return;
+                        }
+                        const cmds = await client.getMyCommands({ type: "default" });
+                        ctx.ui.notify(
+                            cmds.length === 0
+                                ? "Bot command menu: empty (default scope). This bot ignores /-commands — a populated menu would only ever be leftovers from another tool on the same token."
+                                : `Bot command menu: ${cmds.length} entries (default scope) — ${cmds.map((c) => `/${c.command}`).join(" ")} — /telegram commands reset clears it.`,
+                            "info",
+                        );
+                    } catch (err) {
+                        ctx.ui.notify(`telegram commands failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                     }
                     return;
                 }

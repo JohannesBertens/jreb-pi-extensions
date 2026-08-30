@@ -122,6 +122,8 @@ const fakeClient: TelegramClient = {
     },
     answerCallbackQuery: async () => true,
     getUpdates: async () => [],
+    getMyCommands: async () => [],
+    deleteMyCommands: async () => true,
 };
 
 // --- extension wiring (default export) ----------------------------------------
@@ -188,6 +190,21 @@ ok(
     saved.botToken === "NEWTOKEN" && saved.chatId === "42" && saved.enabled === true && cmdNotifications.some((m) => m.includes("Saved")),
     saved,
 );
+
+// /telegram commands — read lists leftovers + hint; reset clears every scope
+calls.length = 0;
+script = (m) => (m === "getMyCommands" ? [{ command: "stale", description: "leftover" }] : true);
+await captured.commands.telegram.handler("commands", cmdCtx);
+ok("/telegram commands lists entries + hint", cmdNotifications.some((m) => m.includes("1 entries") && m.includes("/stale") && m.includes("commands reset")));
+await captured.commands.telegram.handler("commands reset", cmdCtx);
+const delCalls = calls.filter((c) => c.url.endsWith("/deleteMyCommands"));
+const scopeTypes = delCalls.map((c) => c.body.scope?.type);
+ok(
+    "/telegram commands reset clears 4 scopes",
+    delCalls.length === 4 && scopeTypes.includes("default") && scopeTypes.includes("all_private_chats") && scopeTypes.includes("all_group_chats") && delCalls.some((c) => c.body.scope?.type === "chat" && String(c.body.scope?.chat_id) === "42"),
+    { count: delCalls.length, scopeTypes },
+);
+ok("/telegram commands reset announces", cmdNotifications.some((m) => m.includes("cleared")));
 
 // --- M2: validation clone -----------------------------------------------------
 const VQ = (questions: unknown[]) => mod.validateQuestionnaire({ questions } as any);

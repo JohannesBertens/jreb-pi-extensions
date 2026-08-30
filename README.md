@@ -34,12 +34,13 @@ Colorful statusline showing token usage, context window progress, git branch, an
 1. Create a bot with [@BotFather](https://t.me/BotFather) → copy the token.
 2. In pi: `/telegram setup` — paste the token, then send `/start` to your bot in Telegram. The chat is discovered automatically; config is saved to `~/.pi/agent/herdr-telegram.json` (0600).
 
-**Commands:** `/telegram status` · `on` · `off` · `test`.
+**Commands:** `/telegram status` · `on` · `off` · `test` · `commands [reset]`.
 
 - Only the configured chat may answer; every other chat is ignored. Free-text replies become custom answers ("Type something." row). multiSelect questions get toggle buttons + `✅ Submit`.
 - **Multi-question asks end in a review step** (mirroring upstream's Submit tab, single-question asks submit immediately): after the last answer the phone shows `✓ Submit` + `✕ Leave for terminal` — reply with text (or the terminal walker's `✎ Add note`) to attach a **global note** that rides the envelope as `global note: …` and survives declines in `details`. `🗑 Clear note` removes it. Per-question `user notes:` are echoed by the envelope when present (upstream authors them via its full-screen TUI; our lean dialogs don't — known divergence).
 - While a question is open, the message refreshes its `⏳ waiting` line once a minute (stops after 30 min).
 - `/telegram status` shows the upstream-vs-clone drift hint (see **Drift duty** above) plus config/tool state.
+- `/telegram commands` — the bot's **/**-menu is server-side state at Telegram; this bot ignores `/`-commands, so a populated menu is always leftovers from another tool that shared the token (an OpenClaw instance left ~50 there once). `commands` lists them, `commands reset` clears every scope (default · private · group · this chat). Apps may cache the old menu briefly — reopen the chat.
 - `/telegram off` disables remote answering immediately — the tool stays registered and serves local-only dialogs from the next question on. No `/reload` needed.
 
 **Env overrides:** `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (both or neither; they win over the file — `/telegram on|off` only works with a file config).
