@@ -41,11 +41,11 @@ import { join } from "node:path";
 // Command grammar (pure — smoke-tested)
 // ---------------------------------------------------------------------------
 
-export type CommandKind = "steer" | "followup" | "stop" | "help" | "rc" | "plain" | "read" | "keys" | "wait" | "agents";
+export type CommandKind = "steer" | "followup" | "stop" | "help" | "rc" | "plain" | "read" | "keys" | "wait" | "agents" | "new";
 
 export interface ParsedCommand {
     kind: CommandKind;
-    /** Explicit target: "self", a pane id (wA:p1) or an agent name. */
+    /** Explicit target: "self", a pane id (wA:p1) or an agent name. For /new: the @name ("" = auto). */
     target: string;
     /** Remainder text (steer/followup/rc args) or key list (keys). */
     text: string;
@@ -53,6 +53,12 @@ export interface ParsedCommand {
     lines?: number;
     /** /wait timeout in ms. */
     timeoutMs?: number;
+    /** /new agent kind (default pi). */
+    agentKind?: string;
+    /** /new working directory. */
+    cwd?: string;
+    /** /new model flag (pi -m <model>). */
+    model?: string;
 }
 
 /** Words that look like targets: "self" (explicit), pane ids (wA:p1), or a
@@ -123,6 +129,26 @@ export function parseCommand(raw: string | undefined, knownNames: readonly strin
         }
         case "/agents":
             return { kind: "agents", target: "self", text: "" };
+        case "/new": {
+            // `/new [@name] [--kind k] [--cwd path] [--model m] <task>` — the
+            // optional name needs the @ prefix (bare words are task text:
+            // /new fix the tests is ONE task, not agent "fix").
+            const words = rest.split(/\s+/).filter(Boolean);
+            let agentKind = "pi";
+            let cwd: string | undefined;
+            let model: string | undefined;
+            while (words[0] !== undefined && words[0].startsWith("--")) {
+                const flag = words.shift() as string;
+                const value = words.shift();
+                if (flag === "--kind" && value) agentKind = value;
+                else if (flag === "--cwd" && value) cwd = value;
+                else if (flag === "--model" && value) model = value;
+                // Unknown/missing-value flags are ignored (lenient v1).
+            }
+            let target = "";
+            if (words[0]?.startsWith("@") && words.length > 1) target = (words.shift() as string).slice(1);
+            return { kind: "new", target, text: words.join(" "), agentKind, cwd, model };
+        }
         case "/help":
         case "/start":
             return { kind: "help", target: "self", text: "" };
@@ -317,6 +343,8 @@ export interface CommandDeps {
     herdr?: CommandHerdr;
     /** Live agent names for target parsing (default: agent.list, 30 s cache). */
     rosterNames?: () => Promise<string[]>;
+    /** /new detection poll interval, ms (default 1000; test knob). */
+    spawnPollIntervalMs?: number;
 }
 
 export interface CommandHandler {
@@ -364,6 +392,11 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
     let ctrlCPending: { target: string; at: number } | undefined;
     /** agent.name roster cache for parseCommand knownNames (30 s TTL). */
     let rosterCache: { names: string[]; at: number } | undefined;
+    /** /new spawn log (timestamps, 1 h window) + auto-name counter. */
+    let spawnLog: number[] = [];
+    let spawnSeq = 0;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    const pollInterval = deps.spawnPollIntervalMs ?? 1000;
 
     const reply = (text: string): void => {
         const chat = safeChat();
@@ -502,6 +535,77 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
                     if (!r.ok || !Array.isArray(r.result.agents)) return reply(`✖️ /agents failed: ${escapeHtml(r.ok ? "missing agents array" : r.code)}`);
                     const rows = r.result.agents as HerdrAgentRow[];
                     return void (await sendLong(renderRosterTelegram(hostname(), sortAgents(rows), herdr.selfPaneId())));
+                }
+                case "new": {
+                    if (!cmd.text) {
+                        return reply("✏️ usage: <code>/new [@name] [--kind pi|codex|…] [--cwd path] [--model m] &lt;task&gt;</code>");
+                    }
+                    const self = herdr.selfPaneId();
+                    if (!self) return reply("✖️ /new needs this session inside a Herdr pane (it splits a pane beside you).");
+                    // Spawn cap: sliding 1 h window (runaway-loop guard).
+                    const windowStart = now() - 3_600_000;
+                    spawnLog = spawnLog.filter((t) => t >= windowStart);
+                    if (spawnLog.length >= 3) {
+                        return reply(`✖️ spawn cap reached (${spawnLog.length} in the last hour) — /agents to inspect, or wait a bit.`);
+                    }
+                    const name = cmd.target || `task-${(spawnSeq += 1)}`;
+                    const kind = cmd.agentKind ?? "pi";
+                    reply(`⏳ spawning <b>${escapeHtml(name)}</b> (${escapeHtml(kind)})…`);
+
+                    // 1. Split a pane beside this one (cwd flag rides to the child shell).
+                    const split = await herdr.request(
+                        "pane.split",
+                        { target_pane_id: self, direction: "right", focus: false, ratio: 0.34, ...(cmd.cwd ? { cwd: cmd.cwd } : {}) },
+                        { timeoutMs: 8000 },
+                    );
+                    if (!split.ok) return reply(`✖️ pane split failed: ${escapeHtml(split.code)} — ${escapeHtml(oneLine(split.message, 160))}`);
+                    const paneId = String((split.result.pane as Record<string, unknown> | undefined)?.pane_id ?? "");
+                    if (!paneId) return reply("✖️ pane split response missing pane_id");
+
+                    // 2. Launch the agent (returns launch_pending immediately — M0 Appendix A).
+                    const start = await herdr.request(
+                        "agent.start",
+                        { name, kind, pane_id: paneId, args: cmd.model ? ["-m", cmd.model] : [], timeout_ms: 60000 },
+                        { timeoutMs: 70_000 },
+                    );
+                    if (!start.ok) {
+                        // The agent never launched — closing OUR OWN fresh pane is safe.
+                        await herdr.request("pane.close", { pane_id: paneId }, { timeoutMs: 5000 }).catch(() => ({ ok: false }) as const);
+                        return reply(`✖️ agent.start failed: ${escapeHtml(start.code)} — ${escapeHtml(oneLine(start.message, 200))} (pane closed)`);
+                    }
+
+                    // 3. Poll until detection settles (launch_pending clears, status ≠ unknown).
+                    let ready = false;
+                    for (let i = 0; i < 90; i++) {
+                        const g = await herdr.request("agent.get", { target: name }, { timeoutMs: 4000 });
+                        if (g.ok) {
+                            const a = (g.result.agent ?? {}) as Record<string, unknown>;
+                            if (a.launch_pending !== true && String(a.agent_status ?? "unknown") !== "unknown") {
+                                ready = true;
+                                break;
+                            }
+                        }
+                        await sleep(pollInterval);
+                    }
+                    if (!ready) {
+                        // Don't close: the agent may still be starting (slow model
+                        // list, network) — the pane keeps the partial launch.
+                        return reply(`⚠️ ${escapeHtml(name)} not detected within 90 s — pane <code>${escapeHtml(paneId)}</code> kept. Check /read ${escapeHtml(name)} later or inspect the pane.`);
+                    }
+                    spawnLog.push(now());
+
+                    // 4. Hand it the task.
+                    const p = await herdr.request("agent.prompt", { target: name, text: cmd.text }, { timeoutMs: 10_000 });
+                    if (!p.ok) {
+                        if (p.code === "agent_blocked") {
+                            return reply(`🤖 <b>${escapeHtml(name)}</b> is up in <code>${escapeHtml(paneId)}</code> but opened a dialog — /keys ${escapeHtml(name)} to answer.`);
+                        }
+                        return reply(`🤖 <b>${escapeHtml(name)}</b> is up in <code>${escapeHtml(paneId)}</code> but the task prompt failed (${escapeHtml(p.code)}) — send it with /steer ${escapeHtml(name)} &lt;task&gt;.`);
+                    }
+                    const extras = [cmd.cwd ? `cwd ${escapeHtml(cmd.cwd)}` : "", cmd.model ? `model ${escapeHtml(cmd.model)}` : ""].filter(Boolean).join(" · ");
+                    return void (await reply(
+                        `🤖 <b>${escapeHtml(name)}</b> (${escapeHtml(kind)}) live in <code>${escapeHtml(paneId)}</code>${extras ? ` · ${extras}` : ""}\ntrack: /read ${escapeHtml(name)} · steer: /steer ${escapeHtml(name)} &lt;text&gt; · roster: /agents`,
+                    ));
                 }
                 case "help":
                     reply(renderHelp());

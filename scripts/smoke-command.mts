@@ -57,6 +57,11 @@ ok("parse: /stop target (known + pane)", P("/stop reviewer", ["reviewer"])?.targ
 ok("parse: /help", P("/help")?.kind === "help");
 ok("parse: /start → help", P("/start")?.kind === "help");
 ok("parse: /rc on", JSON.stringify(P("/rc on")) === JSON.stringify({ kind: "rc", target: "self", text: "on" }), P("/rc on"));
+ok("parse: /new bare task auto-name", (() => { const c = P("/new fix the flaky tests"); return c?.kind === "new" && c.target === "" && c.text === "fix the flaky tests" && c.agentKind === "pi"; })());
+ok("parse: /new @name", (() => { const c = P("/new @reviewer review the diff"); return c?.target === "reviewer" && c.text === "review the diff"; })());
+ok("parse: /new flags", (() => { const c = P("/new --kind codex --cwd /tmp/x --model gpt-5.4 @rev check it"); return c?.agentKind === "codex" && c?.cwd === "/tmp/x" && c?.model === "gpt-5.4" && c?.target === "rev" && c?.text === "check it"; })());
+ok("parse: /new flags without name", (() => { const c = P("/new --model glm-5.3 do the thing"); return c?.model === "glm-5.3" && c?.target === "" && c?.text === "do the thing"; })());
+ok("parse: @ without rest is task text", (() => { const c = P("/new @todo-list-item"); return c?.target === "" && c?.text === "@todo-list-item"; })());
 ok("parse: /rc status default text", P("/rc")?.text === "");
 ok("parse: unknown slash → help", P("/definitely-not-a-command x")?.kind === "help");
 ok("parse: empty → undefined", P("") === undefined && P(undefined) === undefined);
@@ -264,6 +269,94 @@ ok("shutdown: controller released", !existsSync(controllerPath));
 sent.length = 0; sends.length = 0;
 ok("exec: foreign chat unclaimed", !H(msg("/steer x", "13")));
 ok("exec: nothing sent for foreign chat", sent.length === 0 && sends.length === 0);
+
+// --- 6. /new spawn chain (stubbed socket) -----------------------------------
+const newSent: string[] = [];
+const newChat = { client: { sendMessage: async (_c: string, text: string) => { newSent.push(text); return { message_id: newSent.length }; } }, chatId: "42" };
+const newCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+let newResponse: (call: { method: string; params: Record<string, unknown> }) => any = () => ({ ok: true, result: {} });
+let newClock = 5_000_000;
+const newHerdr = {
+    request: async (method: string, params: Record<string, unknown>) => {
+        const call = { method, params };
+        newCalls.push(call);
+        return newResponse(call);
+    },
+    selfPaneId: () => "wB:p1",
+};
+const nh = mod.createCommandHandler({
+    getChat: () => newChat as any,
+    isIdle: () => true,
+    send: () => {},
+    abort: () => {},
+    herdr: newHerdr as any,
+    rosterNames: async () => [],
+    now: () => newClock,
+    spawnPollIntervalMs: 2,
+});
+const NF = async (u: any) => { nh.handleUpdate(u); for (let i = 0; i < 220; i++) await new Promise((r) => setTimeout(r, 1)); };
+const lastNew = () => newSent.at(-1) ?? "";
+
+// happy path: split → start → detect → prompt (detection poll returns ready on 3rd agent.get)
+let agentGets = 0;
+newResponse = (call) => {
+    if (call.method === "pane.split") return { ok: true, result: { pane: { pane_id: "wB:pZ" } } };
+    if (call.method === "agent.start") return { ok: true, result: { agent: { agent_status: "unknown", launch_pending: true } } };
+    if (call.method === "agent.get") {
+        agentGets += 1;
+        if (agentGets < 3) return { ok: true, result: { agent: { agent_status: "unknown", launch_pending: true } } };
+        return { ok: true, result: { agent: { agent_status: "idle", launch_pending: false } } };
+    }
+    if (call.method === "agent.prompt") return { ok: true, result: {} };
+    return { ok: true, result: {} };
+};
+await NF(msg("/new --kind pi --cwd /tmp/proj @scan scan the repo for TODOs"));
+const splitCall = newCalls.find((c) => c.method === "pane.split");
+ok("new: split beside self, cwd flag", splitCall?.params.target_pane_id === "wB:p1" && splitCall?.params.cwd === "/tmp/proj", splitCall);
+const startCall = newCalls.find((c) => c.method === "agent.start");
+ok("new: start envelope", startCall?.params.name === "scan" && startCall?.params.kind === "pi" && startCall?.params.pane_id === "wB:pZ" && Array.isArray(startCall?.params.args), startCall);
+ok("new: detection polled", agentGets >= 3);
+ok("new: prompt carries task", newCalls.some((c) => c.method === "agent.prompt" && c.params.target === "scan" && c.params.text === "scan the repo for TODOs"));
+ok("new: summary reply", lastNew().includes("scan") && lastNew().includes("wB:pZ") && lastNew().includes("/read scan"), lastNew());
+
+// --model flag → args ["-m", model]
+newCalls.length = 0; newSent.length = 0; agentGets = 99; // detection immediate
+await NF(msg("/new --model glm-5.3 quick check"));
+ok("new: model flag passes -m", (() => { const s = newCalls.find((c) => c.method === "agent.start"); return Array.isArray(s?.params.args) && JSON.stringify(s?.params.args) === '["-m","glm-5.3"]'; })(), newCalls.find((c) => c.method === "agent.start"));
+ok("new: auto-name task-1 used", newCalls.some((c) => c.method === "agent.start" && typeof c.params.name === "string" && /^task-\d+$/.test(c.params.name)));
+
+// spawn cap: 3rd spawn allowed, 4th refused within the window
+await NF(msg("/new another one"));
+ok("new: third spawn succeeds", newSent.some((s) => s.includes("live in")), newSent.at(-1));
+newCalls.length = 0; newSent.length = 0;
+await NF(msg("/new over the cap"));
+ok("new: cap reached reply", lastNew().includes("cap"), lastNew());
+ok("new: no spawn calls after cap", !newCalls.some((c) => c.method === "pane.split"));
+newClock += 3_600_100; // window slides past the logged entries (filter is >=)
+
+// agent.start failure → pane closed + error reply
+newCalls.length = 0; newSent.length = 0; agentGets = 99;
+newResponse = (call) => {
+    if (call.method === "pane.split") return { ok: true, result: { pane: { pane_id: "wB:pZ" } } };
+    if (call.method === "agent.start") return { ok: false, code: "pane_not_ready", message: "pane not at shell prompt" };
+    if (call.method === "pane.close") return { ok: true, result: {} };
+    return { ok: true, result: {} };
+};
+await NF(msg("/new doomed spawn"));
+ok("new: start failure closes pane", newCalls.some((c) => c.method === "pane.close" && c.params.pane_id === "wB:pZ"), newCalls.map((c) => c.method));
+ok("new: start failure replies", lastNew().includes("pane_not_ready"), lastNew());
+
+// detection timeout → pane KEPT + warning (fast poll via spawnPollIntervalMs)
+newCalls.length = 0; newSent.length = 0;
+newResponse = (call) => {
+    if (call.method === "pane.split") return { ok: true, result: { pane: { pane_id: "wB:pQ" } } };
+    if (call.method === "agent.start") return { ok: true, result: { agent: { launch_pending: true } } };
+    if (call.method === "agent.get") return { ok: true, result: { agent: { agent_status: "unknown", launch_pending: true } } };
+    return { ok: true, result: {} };
+};
+await NF(msg("/new never appears"));
+ok("new: detection timeout keeps pane", !newCalls.some((c) => c.method === "pane.close"));
+ok("new: detection timeout warns with pane id", lastNew().includes("not detected") && lastNew().includes("wB:pQ"), lastNew());
 
 rmSync(homeTmp, { recursive: true, force: true });
 console.log("\nsmoke-command: all green");
