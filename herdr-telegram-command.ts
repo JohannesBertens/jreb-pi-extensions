@@ -30,7 +30,9 @@
  * Zero runtime dependencies; network I/O only via herdr-telegram-core.ts.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type PollHub, type PollLease, type TelegramUpdate, getChat as coreGetChat, getSharedPollHub } from "./herdr-telegram-core.ts";
+import { MAX_MESSAGE_CHARS, type PollHub, type PollLease, type TelegramUpdate, escapeHtml, getChat as coreGetChat, getSharedPollHub, oneLine } from "./herdr-telegram-core.ts";
+import { type HerdrRequestOptions, herdrRequest, herdrSocketPath } from "./herdr-socket.ts";
+import { type HerdrAgentRow, renderRosterTelegram, sortAgents } from "./herdr-agent-list.ts";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -39,14 +41,18 @@ import { join } from "node:path";
 // Command grammar (pure — smoke-tested)
 // ---------------------------------------------------------------------------
 
-export type CommandKind = "steer" | "followup" | "stop" | "help" | "rc" | "plain";
+export type CommandKind = "steer" | "followup" | "stop" | "help" | "rc" | "plain" | "read" | "keys" | "wait" | "agents";
 
 export interface ParsedCommand {
     kind: CommandKind;
-    /** Explicit target: "self", a pane id (wA:p1) or an agent name. M1 executes only "self". */
+    /** Explicit target: "self", a pane id (wA:p1) or an agent name. */
     target: string;
-    /** Remainder text (steer/followup/rc args). */
+    /** Remainder text (steer/followup/rc args) or key list (keys). */
     text: string;
+    /** /read line count. */
+    lines?: number;
+    /** /wait timeout in ms. */
+    timeoutMs?: number;
 }
 
 /** Words that look like targets: "self" (explicit), pane ids (wA:p1), or a
@@ -93,6 +99,30 @@ export function parseCommand(raw: string | undefined, knownNames: readonly strin
         }
         case "/stop":
             return { kind: "stop", target: rest && looksLikeTarget(rest, knownNames) ? rest : "self", text: "" };
+        case "/read": {
+            const words = rest.split(/\s+/).filter(Boolean);
+            let target = "self";
+            let lines = 40;
+            if (words[0] && looksLikeTarget(words[0], knownNames)) target = words.shift() as string;
+            const n = words[0] !== undefined ? Number(words[0]) : NaN;
+            if (Number.isFinite(n) && n > 0) lines = Math.min(Math.floor(n), 80);
+            return { kind: "read", target, text: "", lines };
+        }
+        case "/keys": {
+            const words = rest.split(/\s+/).filter(Boolean);
+            const target = words[0] && looksLikeTarget(words[0], knownNames) ? (words.shift() as string) : "self";
+            return { kind: "keys", target, text: words.join(" ") };
+        }
+        case "/wait": {
+            const words = rest.split(/\s+/).filter(Boolean);
+            let target = "self";
+            if (words[0] && looksLikeTarget(words[0], knownNames)) target = words.shift() as string;
+            const n = words[0] !== undefined ? Number(words[0]) : NaN;
+            const timeoutMs = Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 600_000) : 300_000;
+            return { kind: "wait", target, text: "", timeoutMs };
+        }
+        case "/agents":
+            return { kind: "agents", target: "self", text: "" };
         case "/help":
         case "/start":
             return { kind: "help", target: "self", text: "" };
@@ -107,11 +137,15 @@ export function renderHelp(): string {
     return [
         "🎛 <b>pi remote control</b>",
         "<code>&lt;text&gt;</code> — steer this session (or start a turn when idle)",
-        "<code>/steer [self] &lt;text&gt;</code> — redirect mid-run",
-        "<code>/followup [self] &lt;text&gt;</code> — queue after current work",
-        "<code>/stop</code> — abort the current run",
+        "<code>/steer [target] &lt;text&gt;</code> — redirect mid-run (target: pane id / agent name)",
+        "<code>/followup [target] &lt;text&gt;</code> — queue after current work",
+        "<code>/stop [target]</code> — abort the current run",
+        "<code>/agents</code> — roster of every agent (attention-sorted)",
+        "<code>/read [target] [lines]</code> — read an agent's screen (≤80 lines)",
+        "<code>/keys &lt;target&gt; &lt;key&gt;…</code> — esc/enter/up/down/left/right/space/tab · ctrl+c twice",
+        "<code>/wait [target] [ms]</code> — wait for idle/done/blocked (default 5 min)",
         "<code>/rc on|off|status</code> — plain-text control toggle",
-        "<i>/read /keys /wait /new — coming with Herdr pane control (M2/M3)</i>",
+        "<i>/new — spawn a new agent (M3)</i>",
     ].join("\n");
 }
 
@@ -261,6 +295,13 @@ export function claimsUpdate(update: TelegramUpdate, state: ClaimState): boolean
 // Command handler (wiring — injectable deps like createRunTracker)
 // ---------------------------------------------------------------------------
 
+export interface CommandHerdr {
+    /** Socket request seam (default: herdrRequest from herdr-socket.ts). */
+    request(method: string, params: Record<string, unknown>, options?: HerdrRequestOptions): Promise<import("./herdr-socket.ts").HerdrRequestResult>;
+    /** This pane's id (default: $HERDR_PANE_ID). */
+    selfPaneId(): string | undefined;
+}
+
 export interface CommandDeps {
     getChat?: () => { client: { sendMessage(chatId: string, text: string): Promise<unknown> }; chatId: string } | undefined;
     pollHub?: PollHub;
@@ -272,6 +313,10 @@ export interface CommandDeps {
     abort?: () => void;
     /** Streaming probe (default: ctx.isIdle()). */
     isIdle?: () => boolean;
+    /** Herdr socket seam (M2 cross-pane commands). */
+    herdr?: CommandHerdr;
+    /** Live agent names for target parsing (default: agent.list, 30 s cache). */
+    rosterNames?: () => Promise<string[]>;
 }
 
 export interface CommandHandler {
@@ -290,6 +335,12 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
     const controller = deps.controller ?? createController();
     const now = deps.now ?? Date.now;
     const isIdle = deps.isIdle ?? (() => ctxRef?.isIdle() ?? true);
+    const herdr: CommandHerdr =
+        deps.herdr ??
+        ({
+            request: (m, p, o) => herdrRequest(m, p, o),
+            selfPaneId: () => process.env.HERDR_PANE_ID,
+        } satisfies CommandHerdr);
     const doSend = deps.send ?? ((text, mode) => {
         const pi = piRef;
         if (!pi) return;
@@ -309,6 +360,10 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
     let ctxRef: ExtensionContext | undefined;
     let lease: PollLease | undefined;
     let askDepth = 0;
+    /** ctrl+c two-tap confirmation window (target → requested-at). */
+    let ctrlCPending: { target: string; at: number } | undefined;
+    /** agent.name roster cache for parseCommand knownNames (30 s TTL). */
+    let rosterCache: { names: string[]; at: number } | undefined;
 
     const reply = (text: string): void => {
         const chat = safeChat();
@@ -322,34 +377,156 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
         }
     };
 
+    const fetchNames =
+        deps.rosterNames ??
+        (async (): Promise<string[]> => {
+            const r = await herdr.request("agent.list", {}, { timeoutMs: 3000 });
+            return r.ok && Array.isArray(r.result.agents)
+                ? (r.result.agents as Array<Record<string, unknown>>).map((a) => (typeof a.name === "string" ? a.name : "")).filter(Boolean)
+                : [];
+        });
+    const rosterNames = async (): Promise<string[]> => {
+        if (rosterCache && now() - rosterCache.at < 30_000) return rosterCache.names;
+        const names = await fetchNames().catch(() => [] as string[]);
+        rosterCache = { names, at: now() };
+        return names;
+    };
+
+    /** Resolve a parsed target to a Herdr socket target string. */
+    const resolveTarget = (target: string): { ok: true; target: string } | { ok: false; error: string } => {
+        if (target !== "self") return { ok: true, target };
+        const pane = herdr.selfPaneId();
+        return pane ? { ok: true, target: pane } : { ok: false, error: "this session is not in a Herdr pane — name an explicit target (/agents lists panes)" };
+    };
+
     const execute = (cmd: ParsedCommand): void => {
-        // Non-self targets need the Herdr socket (M2). Parse them, say so.
-        if ((cmd.kind === "steer" || cmd.kind === "followup") && cmd.target !== "self") {
-            reply(`⏳ steering <code>${cmd.target}</code> arrives with Herdr pane control (M2) — v1 steers this session only.`);
-            return;
+        // Self-steering (and plain text) stays in-process — first-class
+        // steer/followUp semantics via pi.sendUserMessage.
+        if ((cmd.kind === "steer" || cmd.kind === "followup" || cmd.kind === "plain") && cmd.target === "self") {
+            if (!cmd.text) {
+                reply(`✏️ empty ${cmd.kind === "plain" ? "message" : cmd.kind} — nothing sent.`);
+                return;
+            }
+            const mode = cmd.kind === "followup" ? "followUp" : cmd.kind === "steer" ? "steer" : "auto";
+            doSend(cmd.text, mode);
+            return; // the message itself is the receipt (visible in the TUI transcript)
         }
-        switch (cmd.kind) {
-            case "plain":
-            case "steer":
-            case "followup": {
-                if (!cmd.text) {
-                    reply(`✏️ empty ${cmd.kind === "plain" ? "message" : cmd.kind} — nothing sent.`);
+        // Cross-pane commands run over the Herdr socket; replies land async.
+        void executeRemote(cmd);
+    };
+
+    const executeRemote = async (cmd: ParsedCommand): Promise<void> => {
+        try {
+            switch (cmd.kind) {
+                case "steer":
+                case "followup": {
+                    const t = resolveTarget(cmd.target);
+                    if (!t.ok) return reply(`✖️ ${t.error}`);
+                    if (!cmd.text) return reply("✏️ empty message — nothing sent.");
+                    const r = await herdr.request("agent.prompt", { target: t.target, text: cmd.text }, { timeoutMs: 10_000 });
+                    if (r.ok) return reply(`→ ${cmd.kind === "followup" ? "queued for" : "steered"} <code>${escapeHtml(t.target)}</code>`);
+                    if (r.code === "agent_blocked")
+                        return reply(`🔒 <code>${escapeHtml(t.target)}</code> is blocked on a dialog — inspect with <code>/read ${escapeHtml(t.target)}</code>, answer with <code>/keys ${escapeHtml(t.target)} esc|enter|up|down</code>.`);
+                    if (r.code === "agent_not_found" || r.code === "agent_not_running")
+                        return reply(`✖️ no agent at <code>${escapeHtml(t.target)}</code> — /agents lists live panes.`);
+                    return reply(`✖️ steer failed: ${escapeHtml(r.code)} — ${escapeHtml(oneLine(r.message, 160))}`);
+                }
+                case "stop": {
+                    if (cmd.target === "self") {
+                        doAbort();
+                        reply("⏹ stop requested");
+                        return;
+                    }
+                    const t = resolveTarget(cmd.target);
+                    if (!t.ok) return reply(`✖️ ${t.error}`);
+                    // pi's interrupt key is Esc (same as the local TUI); best-effort.
+                    const r = await herdr.request("agent.send_keys", { target: t.target, keys: ["esc"] }, { timeoutMs: 10_000 });
+                    reply(r.ok ? `⏹ interrupt sent to <code>${escapeHtml(t.target)}</code>` : `✖️ ${escapeHtml(r.code)} — ${escapeHtml(oneLine(r.message, 160))}`);
                     return;
                 }
-                const mode = cmd.kind === "followup" ? "followUp" : cmd.kind === "steer" ? "steer" : "auto";
-                doSend(cmd.text, mode);
-                return; // the message itself is the receipt (visible in the TUI transcript)
+                case "read": {
+                    const t = resolveTarget(cmd.target);
+                    if (!t.ok) return reply(`✖️ ${t.error}`);
+                    const lines = Math.min(cmd.lines ?? 40, 80);
+                    // pi-family agents render on the alternate screen: only
+                    // `visible` returns content (M0 Appendix A); CLI-style
+                    // agents answer via recent_unwrapped fallback.
+                    let r = await herdr.request("agent.read", { target: t.target, source: "visible", lines, strip_ansi: true }, { timeoutMs: 20_000 });
+                    let text = r.ok ? String((r.result.read as Record<string, unknown> | undefined)?.text ?? "") : "";
+                    if (r.ok && text.trim().length === 0) {
+                        r = await herdr.request("agent.read", { target: t.target, source: "recent_unwrapped", lines, strip_ansi: true }, { timeoutMs: 20_000 });
+                        text = r.ok ? String((r.result.read as Record<string, unknown> | undefined)?.text ?? "") : "";
+                    }
+                    if (!r.ok) {
+                        if (r.code === "agent_not_idle") return reply(`⏳ <code>${escapeHtml(t.target)}</code> is busy — /wait ${escapeHtml(t.target)} then retry, or fewer lines.`);
+                        return reply(`✖️ read failed: ${escapeHtml(r.code)} — ${escapeHtml(oneLine(r.message, 160))}`);
+                    }
+                    if (!text.trim()) return reply(`📭 <code>${escapeHtml(t.target)}</code> — screen is empty.`);
+                    const clipped = text.length > MAX_MESSAGE_CHARS - 300 ? `…\n${text.slice(-(MAX_MESSAGE_CHARS - 300))}` : text;
+                    return void (await sendLong(`📖 <code>${escapeHtml(t.target)}</code> · ${lines} lines\n<pre>${escapeHtml(clipped)}</pre>`));
+                }
+                case "keys": {
+                    const t = resolveTarget(cmd.target);
+                    if (!t.ok) return reply(`✖️ ${t.error}`);
+                    const keys = cmd.text.split(/\s+/).filter(Boolean).map((k) => (k === "escape" ? "esc" : k));
+                    if (keys.length === 0) return reply("✏️ no keys — e.g. <code>/keys wB:p2 esc</code> or <code>/keys wB:p2 up enter</code>.");
+                    const allowed = new Set(["esc", "enter", "up", "down", "left", "right", "space", "tab"]);
+                    const bad = keys.filter((k) => !allowed.has(k) && k !== "ctrl+c");
+                    if (bad.length > 0) return reply(`✖️ unsupported key(s): ${bad.map((k) => `<code>${escapeHtml(k)}</code>`).join(" ")} — allowed: esc enter up down left right space tab (ctrl+c with double confirm).`);
+                    if (keys.includes("ctrl+c")) {
+                        const pending = ctrlCPending;
+                        ctrlCPending = { target: t.target, at: now() };
+                        if (!pending || pending.target !== t.target || now() - pending.at > 30_000) {
+                            return reply("⚠️ <code>ctrl+c</code> can kill the agent — send the same command again within 30 s to confirm.");
+                        }
+                        ctrlCPending = undefined;
+                    }
+                    const r = await herdr.request("agent.send_keys", { target: t.target, keys }, { timeoutMs: 10_000 });
+                    reply(r.ok ? `⌨️ sent ${keys.map((k) => `<code>${escapeHtml(k)}</code>`).join(" ")} → <code>${escapeHtml(t.target)}</code>` : `✖️ ${escapeHtml(r.code)} — ${escapeHtml(oneLine(r.message, 160))}`);
+                    return;
+                }
+                case "wait": {
+                    const t = resolveTarget(cmd.target);
+                    if (!t.ok) return reply(`✖️ ${t.error}`);
+                    const timeoutMs = cmd.timeoutMs ?? 300_000;
+                    const r = await herdr.request("agent.wait", { target: t.target, until: ["idle", "done", "blocked"], timeout_ms: timeoutMs }, { timeoutMs: timeoutMs + 10_000 });
+                    if (r.ok) {
+                        const status = String((r.result.agent as Record<string, unknown> | undefined)?.agent_status ?? "idle");
+                        return reply(`⌛ <code>${escapeHtml(t.target)}</code> settled: <b>${escapeHtml(status)}</b>`);
+                    }
+                    if (r.code === "timeout") return reply(`⌛ still not settled after ${Math.round(timeoutMs / 1000)}s — /read ${escapeHtml(t.target)} to peek.`);
+                    return reply(`✖️ wait failed: ${escapeHtml(r.code)} — ${escapeHtml(oneLine(r.message, 160))}`);
+                }
+                case "agents": {
+                    const r = await herdr.request("agent.list", {}, { timeoutMs: 5000 });
+                    if (!r.ok || !Array.isArray(r.result.agents)) return reply(`✖️ /agents failed: ${escapeHtml(r.ok ? "missing agents array" : r.code)}`);
+                    const rows = r.result.agents as HerdrAgentRow[];
+                    return void (await sendLong(renderRosterTelegram(hostname(), sortAgents(rows), herdr.selfPaneId())));
+                }
+                case "help":
+                    reply(renderHelp());
+                    return;
+                case "rc":
+                    replyRc(cmd.text);
+                    return;
+                case "plain":
+                    return; // handled in-process by execute()
             }
-            case "stop":
-                doAbort();
-                reply("⏹ stop requested");
-                return;
-            case "help":
-                reply(renderHelp());
-                return;
-            case "rc":
-                replyRc(cmd.text);
-                return;
+        } catch (err) {
+            reply(`✖️ command failed: ${escapeHtml(err instanceof Error ? err.message : String(err))}`);
+        }
+    };
+
+    /** Long payloads split at MAX_MESSAGE_CHARS (Telegram limit minus headroom). */
+    const sendLong = async (text: string): Promise<void> => {
+        const chat = safeChat();
+        if (!chat) return;
+        if (text.length <= MAX_MESSAGE_CHARS) {
+            await chat.client.sendMessage(chat.chatId, text).catch(() => {});
+            return;
+        }
+        for (let i = 0; i < text.length; i += MAX_MESSAGE_CHARS) {
+            await chat.client.sendMessage(chat.chatId, text.slice(i, i + MAX_MESSAGE_CHARS)).catch(() => {});
         }
     };
 
@@ -394,9 +571,13 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
             const chat = safeChat();
             if (!chat) return false;
             if (!claimsUpdate(update, { enabled: controller.describe().enabled, controller: controller.isController(), askDepth, chatId: chat.chatId })) return false;
-            const cmd = parseCommand(update.message?.text);
-            if (!cmd) return false; // claimed as ours but nothing to do — let it drop
-            execute(cmd);
+            // Claim is decided above (prefix/chat/role only); parsing runs async
+            // so the FIRST command already knows the roster's agent names.
+            void (async () => {
+                await rosterNames();
+                const cmd = parseCommand(update.message?.text, rosterCache?.names ?? []);
+                if (cmd) execute(cmd);
+            })();
             return true;
         },
     };

@@ -21,10 +21,13 @@
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { escapeHtml, getChat, oneLine } from "./herdr-telegram-core.ts";
-import { existsSync } from "node:fs";
+import { herdrRequest, herdrSocketPath as resolveSocketPath } from "./herdr-socket.ts";
 import { hostname } from "node:os";
-import { basename, join } from "node:path";
-import { createConnection, type Socket } from "node:net";
+import { basename } from "node:path";
+
+// Re-exported for back-compat (scripts/smoke-agents.mts and any external use).
+export { __setHerdrSocketFactoryForTests, herdrSocketPath } from "./herdr-socket.ts";
+export type { SocketFactory } from "./herdr-socket.ts";
 
 // ---------------------------------------------------------------------------
 // Socket read (agent.list)
@@ -44,79 +47,31 @@ export interface HerdrAgentRow {
 
 export type AgentQueryResult = { ok: true; agents: HerdrAgentRow[] } | { ok: false; error: string };
 
-export type SocketFactory = (socketPath: string) => Socket;
-
-let socketFactory: SocketFactory = (socketPath) => createConnection(socketPath);
-
-/** Test hook: swap the socket constructor (scripts/smoke-agents.mts). */
-export function __setHerdrSocketFactoryForTests(factory: SocketFactory | undefined): void {
-    socketFactory = factory ?? ((socketPath) => createConnection(socketPath));
-}
-
-/** $HERDR_SOCKET_PATH when set; else the default socket if it exists; else undefined. */
-export function herdrSocketPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
-    if (typeof env.HERDR_SOCKET_PATH === "string" && env.HERDR_SOCKET_PATH.length > 0) {
-        return env.HERDR_SOCKET_PATH;
-    }
-    const fallback = join(env.HOME ?? "~", ".config", "herdr", "herdr.sock");
-    return existsSync(fallback) ? fallback : undefined;
-}
-
 /**
- * One-shot `agent.list` over the Herdr socket: connect, write one request line,
- * parse the first response line, destroy. Never rejects — failures are typed
- * results so the command handler stays throw-free.
+ * One-shot `agent.list` over the Herdr socket (delegates to herdr-socket.ts).
+ * Never rejects — failures are typed results so the command handler stays
+ * throw-free.
  */
-export function queryHerdrAgents(socketPath: string, timeoutMs = 2000): Promise<AgentQueryResult> {
-    return new Promise((resolve) => {
-        let settled = false;
-        let buffer = "";
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const done = (result: AgentQueryResult): void => {
-            if (settled) return;
-            settled = true;
-            if (timer) clearTimeout(timer);
-            try {
-                socket.destroy();
-            } catch {
-                /* already gone */
-            }
-            resolve(result);
-        };
-        const socket = socketFactory(socketPath);
-        timer = setTimeout(() => done({ ok: false, error: "Herdr socket timed out" }), timeoutMs);
-        timer.unref?.();
-        socket.on("error", (err: Error) => done({ ok: false, error: `Herdr socket unreachable (${err.message})` }));
-        socket.on("connect", () => {
-            socket.write(`${JSON.stringify({ id: `pi:agents:${Date.now()}`, method: "agent.list", params: {} })}\n`);
-        });
-        socket.on("data", (chunk: Buffer) => {
-            buffer += chunk.toString("utf8");
-            const newline = buffer.indexOf("\n");
-            if (newline === -1) return; // partial line — wait for more
-            const line = buffer.slice(0, newline).trim();
-            let message: { error?: { code?: string; message?: string }; result?: { agents?: unknown } };
-            try {
-                message = JSON.parse(line);
-            } catch {
-                done({ ok: false, error: `unexpected Herdr response: ${oneLine(line, 120)}` });
-                return;
-            }
-            if (message.error) {
-                done({ ok: false, error: `Herdr error ${message.error.code ?? "unknown"}: ${message.error.message ?? "no message"}` });
-                return;
-            }
-            const agents = message.result?.agents;
-            if (!Array.isArray(agents)) {
-                done({ ok: false, error: "Herdr response missing agents array" });
-                return;
-            }
-            done({ ok: true, agents: agents as HerdrAgentRow[] });
-        });
-        socket.on("end", () => {
-            if (!settled && buffer.trim().length === 0) done({ ok: false, error: "Herdr socket closed before answering" });
-        });
-    });
+export async function queryHerdrAgents(socketPath: string, timeoutMs = 2000): Promise<AgentQueryResult> {
+    const r = await herdrRequest("agent.list", {}, { socketPath, timeoutMs });
+    if (!r.ok) {
+        const error =
+            r.code === "timeout"
+                ? "Herdr socket timed out"
+                : r.code === "unreachable"
+                  ? r.message
+                  : r.code === "bad_response"
+                    ? r.message
+                    : r.code === "closed"
+                      ? "Herdr socket closed before answering"
+                      : `Herdr error ${r.code}: ${r.message}`;
+        return { ok: false, error };
+    }
+    const agents = r.result.agents;
+    if (!Array.isArray(agents)) {
+        return { ok: false, error: "Herdr response missing agents array" };
+    }
+    return { ok: true, agents: agents as HerdrAgentRow[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +161,7 @@ export default function (pi: ExtensionAPI) {
     pi.registerCommand("agents", {
         description: "List all recognized agents in the local Herdr instance (attention-sorted roster)",
         handler: async (_args: string, ctx: ExtensionContext) => {
-            const socketPath = herdrSocketPath();
+            const socketPath = resolveSocketPath();
             if (!socketPath) {
                 ctx.ui.notify(NOT_UNDER_HERDR, "error");
                 return;

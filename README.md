@@ -137,8 +137,15 @@ spawning new agents (`/steer <pane>`, `/read`, `/keys`, `/new`) arrive with
 Herdr socket control (M2/M3).
 
 - **Slash commands** (work in every session with this file loaded):
-  `/steer <text>` (redirect mid-run) · `/followup`/`/queue <text>` (deliver
-  after current work) · `/stop` (abort the run) · `/help` · `/rc on|off|status`.
+  `/steer [target] <text>` (redirect mid-run — target defaults to this session;
+  pane ids like `wB:p2` and named agents steer ANY pane over the Herdr socket) ·
+  `/followup`/`/queue [target] <text>` (deliver after current work) ·
+  `/stop [target]` (abort here / interrupt a foreign agent) · `/agents` ·
+  `/read [target] [lines≤80]` (screen readback; `visible` first, CLI-agent
+  fallback) · `/keys <target> <key>…` (esc/enter/arrows/space/tab; ctrl+c
+  needs a confirming second tap) · `/wait [target] [ms]` (until idle/done/blocked) ·
+  `/help` · `/rc on|off|status`. A blocked target refuses `/steer` with a
+  `/keys` hint (`agent_blocked`).
 - **Plain text** = steering, but only for the **elected controller session**
   (`/rc on`): one session at a time hears free-text messages (heartbeat file
   `~/.pi/agent/herdr-telegram-controller.json`, 10 s beat / 30 s takeover).
@@ -149,10 +156,12 @@ Herdr socket control (M2/M3).
 
 **Privacy:** steering text transits Telegram (same as all herdr-telegram-*
 traffic); the messages themselves land in your session transcript as user
-messages.
+messages. `/read` is deliberate user-initiated readback, capped at 80 lines.
 
 **Smoke:** `node --experimental-strip-types scripts/smoke-command.mts`
-(offline: parse table, controller election, claim precedence, dispatch modes).
+(offline: parse table, controller election, claim precedence, dispatch modes,
+cross-pane envelopes via a stubbed socket). Live check (spawns a scratch
+agent): `node --experimental-strip-types scripts/live-command.mts`.
 
 ### Herdr Blocked on Question (`herdr-blocked-on-question.ts`)
 

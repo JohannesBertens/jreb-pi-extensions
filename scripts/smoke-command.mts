@@ -120,51 +120,139 @@ const handler = mod.createCommandHandler({
     isIdle: () => idle,
     send: (text, mode) => sends.push({ text, mode: idle || mode === "auto" ? (idle ? "send-now" : "auto") : mode }),
     abort: () => { aborted += 1; },
+    rosterNames: async () => [],
 });
 
 ok("handler: subscribed to hub", (mod.bindHandler(handler, fakeHub), recordedSubs.length === 1));
 const H = (u: any) => handler.handleUpdate(u);
+const HF = async (u: any) => { H(u); for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 1)); };
 
-// slash commands work regardless of controller state
-H(msg("/steer tighten the types"));
+// slash commands work regardless of controller state (async dispatch — flush)
+await HF(msg("/steer tighten the types"));
 ok("exec: /steer idle → plain send", sends.at(-1)?.text === "tighten the types" && sends.at(-1)?.mode === "send-now", sends.at(-1));
 idle = false;
-H(msg("/steer pivot to plan B"));
+await HF(msg("/steer pivot to plan B"));
 ok("exec: /steer streaming → steer", sends.at(-1)?.mode === "steer", sends.at(-1));
-H(msg("/followup then typecheck"));
+await HF(msg("/followup then typecheck"));
 ok("exec: /followup streaming → followUp", sends.at(-1)?.mode === "followUp");
 idle = true;
-H(msg("/followup queued while idle"));
+await HF(msg("/followup queued while idle"));
 ok("exec: /followup idle → immediate send", sends.at(-1)?.mode === "send-now");
-H(msg("/stop"));
+await HF(msg("/stop"));
 ok("exec: /stop aborts", aborted === 1);
-H(msg("/help"));
+await HF(msg("/help"));
 ok("exec: /help replies", !!(sent.at(-1)?.includes("/steer")));
 
 // plain text: only as controller without an open question
-H(msg("just checking in"));
+await HF(msg("just checking in"));
 ok("exec: plain text as controller", sends.at(-1)?.text === "just checking in" && sends.at(-1)?.mode === "send-now");
 handler.onToolStart("ask_user_question");
-H(msg("this should reach the wizard, not us"));
+await HF(msg("this should reach the wizard, not us"));
 ok("exec: plain text declined while ask open", sends.at(-1)?.text === "just checking in");
 handler.onToolEnd("ask_user_question");
-H(msg("question closed, hearing again"));
+await HF(msg("question closed, hearing again"));
 ok("exec: plain text after ask closes", sends.at(-1)?.text === "question closed, hearing again");
 
-// foreign targets parse + M2 notice
-sent.length = 0;
-H(msg("/steer wB:p2 from another pane"));
-ok("exec: foreign target → M2 notice", !!(sent.at(-1)?.includes("M2")), sent.at(-1));
+// --- 5. cross-pane commands (stubbed Herdr socket) --------------------------
+const herdrCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+let herdrResponse: () => any = () => ({ ok: true, result: {} });
+const stubHerdr = {
+    request: async (method: string, params: Record<string, unknown>) => {
+        herdrCalls.push({ method, params });
+        return herdrResponse();
+    },
+    selfPaneId: () => "wB:p1",
+};
+const ctl3 = mod.createController({ path: controllerPath, host: "h1", pid: 333, paneId: "wB:p1", now });
+ctl3.enable();
+const rh = mod.createCommandHandler({
+    getChat,
+    pollHub: fakeHub,
+    controller: ctl3,
+    now,
+    isIdle: () => true,
+    send: (text, mode) => sends.push({ text, mode: mode === "auto" ? "send-now" : mode }),
+    abort: () => { aborted += 1; },
+    herdr: stubHerdr as any,
+    rosterNames: async () => ["reviewer"],
+});
+const RH = (u: any) => rh.handleUpdate(u);
+const lastReply = () => sent.at(-1) ?? "";
+const flushCmd = async (u: any) => { RH(u); for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 1)); };
 
-// /rc via Telegram flips the shared controller
+// /steer foreign → agent.prompt over the socket
+sent.length = 0; herdrCalls.length = 0;
+herdrResponse = () => ({ ok: true, result: {} });
+await flushCmd(msg("/steer wB:p2 tighten the types"));
+ok("m2: /steer foreign → agent.prompt", herdrCalls.at(-1)?.method === "agent.prompt" && herdrCalls.at(-1)?.params.target === "wB:p2" && herdrCalls.at(-1)?.params.text === "tighten the types", herdrCalls);
+ok("m2: steer reply confirms", lastReply().includes("steered") && lastReply().includes("wB:p2"), lastReply());
+
+// agent_blocked → /keys hint
+herdrResponse = () => ({ ok: false, code: "agent_blocked", message: "agent is blocked and requires interactive input" });
+await flushCmd(msg("/steer reviewer continue"));
+ok("m2: agent_blocked hint", lastReply().includes("blocked") && lastReply().includes("/keys"), lastReply());
+
+// /read: visible first, fallback when empty
+sent.length = 0; herdrCalls.length = 0;
+let readSeq = 0;
+herdrResponse = () => {
+    const n = readSeq++;
+    if (herdrCalls[n]?.method === "agent.read" && herdrCalls[n].params.source === "visible") return { ok: true, result: { read: { text: "" } } };
+    if (herdrCalls[n]?.method === "agent.read") return { ok: true, result: { read: { text: "cli output line" } } };
+    return { ok: true, result: {} };
+};
+await flushCmd(msg("/read wB:p2 20"));
+ok("m2: /read visible→fallback", herdrCalls.filter((c) => c.method === "agent.read").length === 2 && herdrCalls[1].params.source === "recent_unwrapped", herdrCalls);
+ok("m2: /read lines capped + sent", herdrCalls[0].params.lines === 20 && lastReply().includes("cli output line"), lastReply());
+ok("m2: /read default 40 lines", (() => { readSeq = 0; herdrCalls.length = 0; return true; })());
+
+// /keys: allowlist + two-tap ctrl+c
+sent.length = 0; herdrCalls.length = 0;
+herdrResponse = () => ({ ok: true, result: {} });
+await flushCmd(msg("/keys wB:p2 ctrl+a x"));
+ok("m2: bad key rejected", lastReply().includes("unsupported key"), lastReply());
+await flushCmd(msg("/keys wB:p2 ctrl+c"));
+ok("m2: ctrl+c first tap warns", lastReply().includes("again within 30"), lastReply());
+ok("m2: ctrl+c not sent yet", !herdrCalls.some((c) => c.method === "agent.send_keys"));
+await flushCmd(msg("/keys wB:p2 ctrl+c"));
+ok("m2: ctrl+c second tap sends", herdrCalls.some((c) => c.method === "agent.send_keys" && JSON.stringify(c.params.keys) === '["ctrl+c"]'), herdrCalls);
+ok("m2: escape aliases esc", (() => { herdrCalls.length = 0; return true; })());
+await flushCmd(msg("/keys reviewer escape enter"));
+ok("m2: escape→esc + multi-key + roster name", herdrCalls.some((c) => c.method === "agent.send_keys" && JSON.stringify(c.params.keys) === '["esc","enter"]' && c.params.target === "reviewer"), herdrCalls);
+
+// /wait settle + timeout
+sent.length = 0; herdrCalls.length = 0;
+herdrResponse = () => ({ ok: true, result: { agent: { agent_status: "done" } } });
+await flushCmd(msg("/wait wB:p2 5000"));
+ok("m2: /wait envelope + status", herdrCalls.at(-1)?.method === "agent.wait" && herdrCalls.at(-1)?.params.timeout_ms === 5000 && lastReply().includes("done"), lastReply());
+herdrResponse = () => ({ ok: false, code: "timeout", message: "timed out" });
+await flushCmd(msg("/wait wB:p2"));
+ok("m2: /wait default timeout + timeout reply", herdrCalls.at(-1)?.params.timeout_ms === 300000 && lastReply().includes("still not settled"), lastReply());
+
+// /agents roster push
+sent.length = 0; herdrCalls.length = 0;
+herdrResponse = () => ({ ok: true, result: { agents: [{ agent: "pi", agent_status: "working", pane_id: "wB:p2", cwd: "/x/repo" }] } });
+await flushCmd(msg("/agents"));
+ok("m2: /agents pushes roster", lastReply().includes("wB:p2") && lastReply().includes("working"), lastReply());
+
+// /stop foreign → send_keys esc; /stop self → in-process abort
+sent.length = 0; herdrCalls.length = 0; aborted = 0;
+herdrResponse = () => ({ ok: true, result: {} });
+await flushCmd(msg("/stop wB:p2"));
+ok("m2: /stop foreign → esc", herdrCalls.some((c) => c.method === "agent.send_keys" && c.params.target === "wB:p2" && JSON.stringify(c.params.keys) === '["esc"]'));
+herdrCalls.length = 0;
+await flushCmd(msg("/stop"));
+ok("m2: /stop self → abort", aborted === 1 && !herdrCalls.some((c) => c.method === "agent.send_keys"));
+
+// /rc via Telegram flips the shared controller (original handler)
 sent.length = 0;
-H(msg("/rc status"));
+await HF(msg("/rc status"));
 ok("exec: /rc status replies", !!(sent.at(-1)?.includes("rc:")));
-H(msg("/rc off"));
+await HF(msg("/rc off"));
 ok("exec: /rc off disables", !ctl2.isController() && !existsSync(controllerPath));
-H(msg("nobody hears this"));
+await HF(msg("nobody hears this"));
 ok("exec: plain ignored after /rc off", sends.at(-1)?.text === "question closed, hearing again");
-H(msg("/steer still works after off"));
+await HF(msg("/steer still works after off"));
 ok("exec: slash still works after /rc off", sends.at(-1)?.text === "still works after off");
 
 // shutdown releases
