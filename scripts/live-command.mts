@@ -71,7 +71,10 @@ const handler = mod.createCommandHandler({
     isIdle: () => true,
     send: () => {}, // self-steer is covered by smoke; live test is cross-pane
     abort: () => {},
-    rosterNames: async () => [NAME],
+    rosterNames: async () => {
+        const r = await rpc("agent.list", {});
+        return ((r.result?.agents ?? []) as Array<Record<string, unknown>>).map((a) => (typeof a.name === "string" ? a.name : "")).filter(Boolean);
+    },
     now: Date.now,
 });
 const send = async (text: string) => {
@@ -120,6 +123,24 @@ try {
     // /keys esc is harmless when idle
     r = await send(`/keys ${NAME} esc`);
     ok("/keys esc sent", r.includes("esc"), r);
+
+    // /new spawns a real agent (full global extensions — progress/ask active).
+    // The chain replies twice (⏳ then summary) — poll for the final one.
+    handler.handleUpdate({ message: { chat: { id: 42 }, text: "/new @livenew Reply with exactly: LIVE-NEW-OK" } } as any);
+    r = "";
+    for (let i = 0; i < 600 && !(r.includes("live in") || r.includes("✖️") || r.includes("⚠️")); i++) {
+        await new Promise((res) => setTimeout(res, 200));
+        const last = String(replies.at(-1) ?? "");
+        if (last !== "⏳ spawning <b>livenew</b> (pi)…") r = last;
+    }
+    replies.length = 0;
+    ok("/new summary", r.includes("livenew") && r.includes("live in"), r);
+    await rpc("agent.wait", { target: "livenew", until: ["idle", "done", "blocked"], timeout_ms: 120000 }, 130000);
+    r = await send("/read livenew 30");
+    ok("/new agent answered", r.includes("LIVE-NEW-OK"), r.slice(0, 300));
+    const list = await rpc("agent.list", {});
+    const livePane = (list.result?.agents ?? []).find((a: any) => a.name === "livenew")?.pane_id;
+    if (livePane) await rpc("pane.close", { pane_id: livePane });
 
     console.log("\nlive-command: all green");
 } finally {

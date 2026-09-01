@@ -130,11 +130,11 @@ mini-ai — Herdr roster · 2 agents · 1 blocked · 1 working
 ### Herdr Telegram Command (`herdr-telegram-command.ts`)
 
 **Impromptu control of a pi session from Telegram** — steer the running agent,
-queue a follow-up, or abort, from your phone. Self-steering uses pi's
-first-class in-process API (`pi.sendUserMessage` with `deliverAs:
-"steer" | "followUp"`) — no terminal injection. Cross-pane steering and
-spawning new agents (`/steer <pane>`, `/read`, `/keys`, `/new`) arrive with
-Herdr socket control (M2/M3).
+queue a follow-up, abort, or spawn a brand-new agent pane, from your phone.
+Self-steering uses pi's first-class in-process API (`pi.sendUserMessage` with
+`deliverAs: "steer" | "followUp"`) — no terminal injection. Cross-pane
+steering and spawning run over Herdr's socket (`agent.prompt`,
+`agent.send_keys`, `agent.read`, `agent.wait`, `pane.split` + `agent.start`).
 
 - **Slash commands** (work in every session with this file loaded):
   `/steer [target] <text>` (redirect mid-run — target defaults to this session;
@@ -144,6 +144,9 @@ Herdr socket control (M2/M3).
   `/read [target] [lines≤80]` (screen readback; `visible` first, CLI-agent
   fallback) · `/keys <target> <key>…` (esc/enter/arrows/space/tab; ctrl+c
   needs a confirming second tap) · `/wait [target] [ms]` (until idle/done/blocked) ·
+  `/new [@name] [--kind pi|codex|…] [--cwd path] [--model m] <task>` (splits a
+  pane beside you, launches the agent, hands it the task; spawn cap 3/hour;
+  a slow pane shell is retried, a failed launch closes only our own pane) ·
   `/help` · `/rc on|off|status`. A blocked target refuses `/steer` with a
   `/keys` hint (`agent_blocked`).
 - **Plain text** = steering, but only for the **elected controller session**

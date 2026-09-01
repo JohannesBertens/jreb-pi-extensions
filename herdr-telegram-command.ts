@@ -563,11 +563,18 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
                     if (!paneId) return reply("✖️ pane split response missing pane_id");
 
                     // 2. Launch the agent (returns launch_pending immediately — M0 Appendix A).
-                    const start = await herdr.request(
-                        "agent.start",
-                        { name, kind, pane_id: paneId, args: cmd.model ? ["-m", cmd.model] : [], timeout_ms: 60000 },
-                        { timeoutMs: 70_000 },
-                    );
+                    // agent_pane_busy = the fresh pane's shell is still initializing
+                    // (verified live: split→start race) — brief retries absorb it.
+                    let start: Awaited<ReturnType<typeof herdr.request>> = { ok: false, code: "unreached", message: "" };
+                    for (let attempt = 0; attempt < 4; attempt++) {
+                        start = await herdr.request(
+                            "agent.start",
+                            { name, kind, pane_id: paneId, args: cmd.model ? ["-m", cmd.model] : [], timeout_ms: 60000 },
+                            { timeoutMs: 70_000 },
+                        );
+                        if (start.ok || start.code !== "agent_pane_busy") break;
+                        await sleep(1000 + attempt * 500);
+                    }
                     if (!start.ok) {
                         // The agent never launched — closing OUR OWN fresh pane is safe.
                         await herdr.request("pane.close", { pane_id: paneId }, { timeoutMs: 5000 }).catch(() => ({ ok: false }) as const);
@@ -593,6 +600,9 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
                         return reply(`⚠️ ${escapeHtml(name)} not detected within 90 s — pane <code>${escapeHtml(paneId)}</code> kept. Check /read ${escapeHtml(name)} later or inspect the pane.`);
                     }
                     spawnLog.push(now());
+                    // The new name must be targetable IMMEDIATELY ("/read <name>"
+                    // right after /new) — inject it into the roster cache.
+                    rosterCache = { names: [...(rosterCache?.names ?? []), name], at: now() };
 
                     // 4. Hand it the task.
                     const p = await herdr.request("agent.prompt", { target: name, text: cmd.text }, { timeoutMs: 10_000 });
