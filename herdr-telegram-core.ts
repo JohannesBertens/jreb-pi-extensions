@@ -157,6 +157,8 @@ export interface TelegramConfig {
     enabled: boolean;
     /** herdr-telegram-progress on/off (default true when absent). */
     progress?: boolean;
+    /** herdr-agent-live roster on/off (default true when absent). */
+    liveRoster?: boolean;
 }
 
 const CONFIG_DIR = join(process.env.HOME ?? "~", ".pi", "agent");
@@ -170,7 +172,7 @@ export function readConfigFile(path: string = CONFIG_PATH): TelegramConfig | und
         const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<TelegramConfig>;
         if (typeof raw.botToken !== "string" || raw.botToken.length === 0) return undefined;
         if (typeof raw.chatId !== "string" || raw.chatId.length === 0) return undefined;
-        return { botToken: raw.botToken, chatId: raw.chatId, enabled: raw.enabled !== false, progress: raw.progress };
+        return { botToken: raw.botToken, chatId: raw.chatId, enabled: raw.enabled !== false, progress: raw.progress, liveRoster: raw.liveRoster };
     } catch {
         return undefined;
     }
@@ -191,7 +193,7 @@ export function loadConfig(
     const envToken = env.TELEGRAM_BOT_TOKEN?.trim();
     const envChat = env.TELEGRAM_CHAT_ID?.trim();
     if (envToken && envChat) {
-        return { config: { botToken: envToken, chatId: envChat, enabled: file?.enabled ?? true, progress: file?.progress }, source: "env", split: false };
+        return { config: { botToken: envToken, chatId: envChat, enabled: file?.enabled ?? true, progress: file?.progress, liveRoster: file?.liveRoster }, source: "env", split: false };
     }
     if (envToken || envChat) {
         // Partial env config is never usable — say so rather than half-work.

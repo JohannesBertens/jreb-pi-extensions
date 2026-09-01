@@ -155,12 +155,40 @@ export function renderRosterTelegram(host: string, agents: HerdrAgentRow[], self
 // Extension wiring
 // ---------------------------------------------------------------------------
 
+/** Best-effort callback for the `live` subcommand — set by herdr-agent-live.ts
+ *  at load (dependency direction: live → list, never the reverse).
+ *
+ *  Cross-copy safety: pi evaluates every extension file with its own jiti
+ *  instance (moduleCache: false — see herdr-telegram-core.ts header + spike
+ *  scripts/spike-jiti-singleton.mts), so herdr-agent-live.ts's import of this
+ *  file is a DIFFERENT module copy than the one pi evaluates as the extension.
+ *  Module-level state would silently split — the registration MUST live on
+ *  globalThis behind Symbol.for, same pattern as the PollHub. */
+export type LiveCommandHandler = (sub: string, ctx: ExtensionContext) => void | Promise<void>;
+const LIVE_HANDLER_KEY = Symbol.for("herdr-agent-list.liveHandler");
+export function registerLiveHandler(handler: LiveCommandHandler | undefined): void {
+    (globalThis as typeof globalThis & { [LIVE_HANDLER_KEY]?: LiveCommandHandler })[LIVE_HANDLER_KEY] = handler;
+}
+function liveHandler(): LiveCommandHandler | undefined {
+    return (globalThis as typeof globalThis & { [LIVE_HANDLER_KEY]?: LiveCommandHandler })[LIVE_HANDLER_KEY];
+}
+
 const NOT_UNDER_HERDR = "not running under Herdr — start pi inside a Herdr pane (no HERDR_SOCKET_PATH and no default socket found)";
 
 export default function (pi: ExtensionAPI) {
     pi.registerCommand("agents", {
-        description: "List all recognized agents in the local Herdr instance (attention-sorted roster)",
-        handler: async (_args: string, ctx: ExtensionContext) => {
+        description: "List all recognized agents in the local Herdr instance (attention-sorted roster); `live` subcommand for the Telegram fleet message",
+        handler: async (args: string, ctx: ExtensionContext) => {
+            const words = args.trim().split(/\s+/).filter(Boolean);
+            if (words[0]?.toLowerCase() === "live") {
+                const handler = liveHandler();
+                if (!handler) {
+                    ctx.ui.notify("live roster module not loaded — is herdr-agent-live.ts installed?", "error");
+                    return;
+                }
+                await handler(words[1]?.toLowerCase() ?? "", ctx);
+                return;
+            }
             const socketPath = resolveSocketPath();
             if (!socketPath) {
                 ctx.ui.notify(NOT_UNDER_HERDR, "error");
