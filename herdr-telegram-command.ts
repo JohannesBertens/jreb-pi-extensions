@@ -318,6 +318,24 @@ export function claimsUpdate(update: TelegramUpdate, state: ClaimState): boolean
     return state.enabled && state.controller && state.askDepth === 0;
 }
 
+/** Relay one inbound text to the elected controller's pane over the Herdr
+ *  socket. Called by processes that CONSUMED a Telegram update they could not
+ *  serve (progress-open-run polls, non-controller command consumers) — the
+ *  alternative is silent loss: Telegram's getUpdates offset already advanced,
+ *  so the controller will never see the message otherwise. Fire-and-forget,
+ *  never throws. No-op when: not under Herdr, no controller file, stale
+ *  heartbeat, dead pid, or the controller is THIS pane (we'd re-eat it). */
+export async function relayToController(text: string): Promise<boolean> {
+    const pane = process.env.HERDR_PANE_ID;
+    const lock = readController(CONTROLLER_PATH);
+    if (!lock || !lock.paneId) return false;
+    if (lock.host !== hostname() || !pidAlive(lock.pid)) return false;
+    if (Date.now() - lock.heartbeatAt > CONTROLLER_STALE_MS) return false;
+    if (pane && lock.paneId === pane) return false; // ours — do not re-inject
+    const r = await herdrRequest("agent.prompt", { target: lock.paneId, text }, { timeoutMs: 8000 });
+    return r.ok;
+}
+
 // ---------------------------------------------------------------------------
 // Command handler (wiring — injectable deps like createRunTracker)
 // ---------------------------------------------------------------------------
@@ -327,6 +345,8 @@ export interface CommandHerdr {
     request(method: string, params: Record<string, unknown>, options?: HerdrRequestOptions): Promise<import("./herdr-socket.ts").HerdrRequestResult>;
     /** This pane's id (default: $HERDR_PANE_ID). */
     selfPaneId(): string | undefined;
+    /** Relay seam for the progress extension + non-controller consumers (default: relayToController). */
+    relay?(text: string): Promise<boolean>;
 }
 
 export interface CommandDeps {
@@ -721,7 +741,21 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
             void (async () => {
                 await rosterNames();
                 const cmd = parseCommand(update.message?.text, rosterCache?.names ?? []);
-                if (cmd) execute(cmd);
+                if (!cmd) return;
+                // Non-controllers never execute default-target commands locally
+                // (the locked decision: "self" = the controller session). The
+                // consuming poll already advanced Telegram's offset — relay or
+                // the message is lost. Explicitly-targeted commands are absolute
+                // (socket-routed) and /rc|/help are local intent — those run here.
+                const explicitTarget =
+                    cmd.target !== "self" && ["steer", "followup", "stop", "read", "keys", "wait"].includes(cmd.kind);
+                const localIntent = cmd.kind === "rc" || cmd.kind === "help";
+                if (!controller.isController() && !explicitTarget && !localIntent) {
+                    const relay = herdr.relay ?? relayToController;
+                    if (await relay(update.message?.text ?? "")) return;
+                    // No controller / relay failed → serve locally (best effort).
+                }
+                execute(cmd);
             })();
             return true;
         },

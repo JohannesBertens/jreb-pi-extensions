@@ -4,7 +4,7 @@
 // Run: node --experimental-strip-types scripts/smoke-command.mts
 
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const homeTmp = mkdtempSync(join(tmpdir(), "smoke-tgcmd-home-"));
@@ -12,6 +12,7 @@ process.env.HOME = homeTmp;
 
 const core = await import("../herdr-telegram-core.ts");
 const mod = await import("../herdr-telegram-command.ts");
+const { EventEmitter } = await import("node:events");
 
 const ok = (label: string, cond: boolean, detail?: unknown) => {
     if (!cond) {
@@ -390,6 +391,56 @@ newResponse = (call) => {
 await NF(msg("/new never appears"));
 ok("new: detection timeout keeps pane", !newCalls.some((c) => c.method === "pane.close"));
 ok("new: detection timeout warns with pane id", lastNew().includes("not detected") && lastNew().includes("wB:pQ"), lastNew());
+
+// --- 7. relay: unclaimed text reaches the controller, never dropped --------
+const progress = await import("../herdr-telegram-progress.ts");
+ok("relay predicate: slash always", progress.shouldRelayUnclaimedText("/steer x", 1) === true && progress.shouldRelayUnclaimedText("/x", 0) === true);
+ok("relay predicate: plain only without open question", progress.shouldRelayUnclaimedText("hi", 0) === true && progress.shouldRelayUnclaimedText("hi", 1) === false);
+ok("relay predicate: empty never", progress.shouldRelayUnclaimedText("", 0) === false && progress.shouldRelayUnclaimedText(undefined, 0) === false);
+
+// relayToController: controller-file gating + agent.prompt delivery
+const relayCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
+const sockMod = await import("../herdr-socket.ts");
+sockMod.__setHerdrSocketFactoryForTests(() => {
+    const fake = new EventEmitter() as any;
+    fake.write = (line: string) => { relayCalls.push(JSON.parse(line)); fake.emit("data", JSON.stringify({ id: "x", result: {} }) + "\n"); };
+    fake.destroy = () => {};
+    process.nextTick(() => fake.emit("connect"));
+    return fake;
+});
+process.env.HERDR_PANE_ID = "wX:p9"; // we are NOT the controller
+const ctlFile = mod.CONTROLLER_PATH;
+ok("relay: no controller file → no-op", (await mod.relayToController("hi")) === false && relayCalls.length === 0);
+writeFileSync(ctlFile, JSON.stringify({ host: "other-host", pid: process.pid, paneId: "wY:p1", heartbeatAt: Date.now() }));
+ok("relay: foreign host → no-op", (await mod.relayToController("hi")) === false && relayCalls.length === 0);
+writeFileSync(ctlFile, JSON.stringify({ host: hostname(), pid: process.pid, paneId: "wX:p9", heartbeatAt: Date.now() }));
+ok("relay: own pane → no-op (no re-inject)", (await mod.relayToController("hi")) === false && relayCalls.length === 0);
+writeFileSync(ctlFile, JSON.stringify({ host: hostname(), pid: process.pid, paneId: "wY:p1", heartbeatAt: Date.now() - 60_000 }));
+ok("relay: stale heartbeat → no-op", (await mod.relayToController("hi")) === false && relayCalls.length === 0);
+writeFileSync(ctlFile, JSON.stringify({ host: hostname(), pid: process.pid, paneId: "wY:p1", heartbeatAt: Date.now() }));
+ok("relay: fresh foreign controller → agent.prompt", (await mod.relayToController("/steer hello")) === true && relayCalls.at(-1)?.method === "agent.prompt" && relayCalls.at(-1)?.params.target === "wY:p1" && relayCalls.at(-1)?.params.text === "/steer hello", relayCalls);
+rmSync(ctlFile, { force: true });
+sockMod.__setHerdrSocketFactoryForTests(undefined);
+
+// non-controller command consumer: default-target commands relay, explicit ones execute
+const relayed: string[] = [];
+const rh2 = mod.createCommandHandler({
+    getChat,
+    isIdle: () => true,
+    send: (text: string) => sends.push({ text, mode: "send-now" }),
+    abort: () => {},
+    herdr: { ...stubHerdr, relay: async (text: string) => { relayed.push(text); return true; } } as any,
+    rosterNames: async () => [],
+});
+ctl3.disable(); // this handler's session is NOT the controller
+const RH2 = async (u: any) => { rh2.handleUpdate(u); for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 1)); };
+sends.length = 0; herdrCalls.length = 0;
+await RH2(msg("/steer hello there"));
+ok("relay: non-controller /steer self relays", relayed.at(-1) === "/steer hello there" && !sends.some((s) => s.text === "hello there"), { relayed, sends });
+await RH2(msg("/steer wB:p2 explicit target"));
+ok("relay: explicit target still executes locally", herdrCalls.some((c) => c.method === "agent.prompt" && c.params.target === "wB:p2") && !relayed.some((t) => t.includes("explicit")), { relayed });
+await RH2(msg("/rc status"));
+ok("relay: /rc stays local", !relayed.some((t) => t.includes("/rc")));
 
 rmSync(homeTmp, { recursive: true, force: true });
 console.log("\nsmoke-command: all green");

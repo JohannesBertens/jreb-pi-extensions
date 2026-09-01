@@ -19,22 +19,8 @@
  * herdr-telegram-core.ts (injectable transport + shared PollHub).
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-    type PollHub,
-    type PollLease,
-    type TelegramClient,
-    type TelegramUpdate,
-    escapeHtml,
-    formatElapsed,
-    formatTokens,
-    getChat as coreGetChat,
-    getSharedPollHub,
-    loadConfig,
-    oneLine,
-    progressEnabled,
-    readConfigFile,
-    writeConfigFile,
-} from "./herdr-telegram-core.ts";
+import { type PollHub, type PollLease, type TelegramClient, type TelegramUpdate, escapeHtml, formatElapsed, formatTokens, getChat as coreGetChat, getSharedPollHub, loadConfig, oneLine, progressEnabled, readConfigFile, writeConfigFile } from "./herdr-telegram-core.ts";
+import { relayToController } from "./herdr-telegram-command.ts";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 
@@ -304,6 +290,17 @@ interface AssistantLike {
 // The tracker
 // ---------------------------------------------------------------------------
 
+/** Should THIS process relay an unclaimed Telegram text to the controller?
+ *  Pure predicate (smoke-tested): slash text always relays (no wizard eats
+ *  slash commands); plain text relays ONLY when no ask_user_question is open
+ *  here — an open wizard owns plain text (it's an ANSWER, never steering). */
+export function shouldRelayUnclaimedText(text: string | undefined, askDepth: number): boolean {
+    const t = (text ?? "").trim();
+    if (t.length === 0) return false;
+    if (t.startsWith("/")) return true;
+    return askDepth === 0;
+}
+
 export function createRunTracker(deps: ProgressDeps = {}): RunTracker {
     const getChat = deps.getChat ?? coreGetChat;
     const enabled = deps.enabled ?? progressEnabled;
@@ -375,6 +372,13 @@ export function createRunTracker(deps: ProgressDeps = {}): RunTracker {
     const client = (): { client: TelegramClient; chatId: string } | undefined => {
         try {
             return getChat();
+        } catch {
+            return undefined;
+        }
+    };
+    const clientChatId = (): string | undefined => {
+        try {
+            return client()?.chatId;
         } catch {
             return undefined;
         }
@@ -469,12 +473,21 @@ export function createRunTracker(deps: ProgressDeps = {}): RunTracker {
         }
     };
 
+
     /** Claim-routed update handler: p:-prefixed callbacks are always ours to
      *  consume (own → act, foreign → toast naming the owner); everything else
-     *  (wizard nonces, messages) passes through. */
+     *  (wizard nonces, messages) passes through. Unclaimed TEXT relays to the
+     *  controller — this poll already advanced Telegram's offset, so dropping
+     *  it would silently lose the message (verified live during the phone test). */
     const handleUpdate = (u: TelegramUpdate): boolean => {
         const cb = u.callback_query;
-        if (!cb) return false;
+        if (!cb) {
+            const text = u.message?.text;
+            if (shouldRelayUnclaimedText(text, askDepth) && String(u.message?.chat?.id ?? "") === clientChatId()) {
+                void relayToController(text as string).catch(() => {});
+            }
+            return false;
+        }
         const data = cb.data ?? "";
         if (!data.startsWith(PROGRESS_NONCE_PREFIX)) return false;
         const chat = client();
