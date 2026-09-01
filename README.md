@@ -148,7 +148,9 @@ steering and spawning run over Herdr's socket (`agent.prompt`,
   pane beside you, launches the agent, hands it the task; spawn cap 3/hour;
   a slow pane shell is retried, a failed launch closes only our own pane) ·
   `/help` · `/rc on|off|status`. A blocked target refuses `/steer` with a
-  `/keys` hint (`agent_blocked`).
+  `/keys` hint (`agent_blocked`). `/agents` is unified with the live roster:
+  when the fleet message has a fresh owner (herdr-agent-live's lock), it EDITS
+  that message instead of pushing a duplicate; otherwise it one-shot pushes.
 - **Plain text** = steering, but only for the **elected controller session**
   (`/rc on`): one session at a time hears free-text messages (heartbeat file
   `~/.pi/agent/herdr-telegram-controller.json`, 10 s beat / 30 s takeover).

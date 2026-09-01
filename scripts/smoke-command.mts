@@ -3,7 +3,7 @@
 //
 // Run: node --experimental-strip-types scripts/smoke-command.mts
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -237,8 +237,41 @@ ok("m2: /wait default timeout + timeout reply", herdrCalls.at(-1)?.params.timeou
 // /agents roster push
 sent.length = 0; herdrCalls.length = 0;
 herdrResponse = () => ({ ok: true, result: { agents: [{ agent: "pi", agent_status: "working", pane_id: "wB:p2", cwd: "/x/repo" }] } });
+const rosterEdits: Array<{ messageId: number; text: string }> = [];
+let rosterEditFails = false;
+(fakeChat.client as any).editMessageText = async (_c: string, messageId: number, text: string) => {
+    if (rosterEditFails) throw new Error("message to edit not found");
+    rosterEdits.push({ messageId, text });
+    return true;
+};
+const lockDir = join(homeTmp, ".pi", "agent");
+mkdirSync(lockDir, { recursive: true });
+const lockFile = join(lockDir, "herdr-roster.lock");
+
+// no lock → one-shot push (existing behavior)
 await flushCmd(msg("/agents"));
-ok("m2: /agents pushes roster", lastReply().includes("wB:p2") && lastReply().includes("working"), lastReply());
+ok("m2: /agents pushes roster", !!(sent.at(-1)?.includes("wB:p2")) && !!(sent.at(-1)?.includes("working")) && rosterEdits.length === 0, sent.at(-1));
+
+// fresh lock (own pid, current heartbeat, message id) → EDIT the live message
+writeFileSync(lockFile, JSON.stringify({ pid: process.pid, heartbeat: clock, messageId: 777 }));
+sent.length = 0;
+await flushCmd(msg("/agents"));
+ok("unify: fresh lock edits live message", rosterEdits.at(-1)?.messageId === 777 && !!(rosterEdits.at(-1)?.text.includes("wB:p2")) && !!(rosterEdits.at(-1)?.text.includes("📡 live")), rosterEdits.at(-1));
+ok("unify: edit confirmed via toast", !!(sent.at(-1)?.includes("live roster refreshed")) && !sent.some((s) => s.includes("🖥")), sent.at(-1));
+
+// stale lock → one-shot push fallback
+writeFileSync(lockFile, JSON.stringify({ pid: process.pid, heartbeat: clock - 120_000, messageId: 777 }));
+rosterEdits.length = 0; sent.length = 0;
+await flushCmd(msg("/agents"));
+ok("unify: stale lock falls back to push", rosterEdits.length === 0 && !!(sent.at(-1)?.includes("wB:p2")), sent.at(-1));
+
+// fresh lock but edit fails → push fallback
+writeFileSync(lockFile, JSON.stringify({ pid: process.pid, heartbeat: clock, messageId: 777 }));
+rosterEditFails = true; rosterEdits.length = 0; sent.length = 0;
+await flushCmd(msg("/agents"));
+ok("unify: failed edit falls back to push", rosterEdits.length === 0 && !!(sent.at(-1)?.includes("wB:p2")), sent.at(-1));
+rosterEditFails = false;
+rmSync(lockFile, { force: true });
 
 // /stop foreign → send_keys esc; /stop self → in-process abort
 sent.length = 0; herdrCalls.length = 0; aborted = 0;

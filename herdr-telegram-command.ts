@@ -33,6 +33,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { MAX_MESSAGE_CHARS, type PollHub, type PollLease, type TelegramUpdate, escapeHtml, getChat as coreGetChat, getSharedPollHub, oneLine } from "./herdr-telegram-core.ts";
 import { type HerdrRequestOptions, herdrRequest, herdrSocketPath } from "./herdr-socket.ts";
 import { type HerdrAgentRow, renderRosterTelegram, sortAgents } from "./herdr-agent-list.ts";
+import { pidAlive, readRosterLock } from "./herdr-agent-live.ts";
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -329,7 +330,15 @@ export interface CommandHerdr {
 }
 
 export interface CommandDeps {
-    getChat?: () => { client: { sendMessage(chatId: string, text: string): Promise<unknown> }; chatId: string } | undefined;
+    getChat?: () =>
+        | {
+              client: {
+                  sendMessage(chatId: string, text: string): Promise<unknown>;
+                  editMessageText?(chatId: string, messageId: number, text: string): Promise<unknown>;
+              };
+              chatId: string;
+          }
+        | undefined;
     pollHub?: PollHub;
     controller?: Controller;
     now?: () => number;
@@ -534,7 +543,29 @@ export function createCommandHandler(deps: CommandDeps = {}): CommandHandler {
                     const r = await herdr.request("agent.list", {}, { timeoutMs: 5000 });
                     if (!r.ok || !Array.isArray(r.result.agents)) return reply(`✖️ /agents failed: ${escapeHtml(r.ok ? "missing agents array" : r.code)}`);
                     const rows = r.result.agents as HerdrAgentRow[];
-                    return void (await sendLong(renderRosterTelegram(hostname(), sortAgents(rows), herdr.selfPaneId())));
+                    const rosterText = renderRosterTelegram(hostname(), sortAgents(rows), herdr.selfPaneId());
+
+                    // Unification: when the live roster engine owns a fleet
+                    // message (fresh lock — herdr-agent-live's election), EDIT
+                    // it instead of pushing a duplicate one-shot. Same format
+                    // the engine renders (roster + live footer).
+                    const lock = readRosterLock();
+                    const fresh = lock && pidAlive(lock.pid) && now() - lock.heartbeat < 90_000 && lock.messageId !== undefined;
+                    const chat = safeChat();
+                    if (fresh && chat && lock && typeof chat.client.editMessageText === "function") {
+                        const d = new Date(now());
+                        const hhmm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+                        const text = `${rosterText}\n📡 live · updated ${hhmm}`;
+                        const edited = await chat.client
+                            .editMessageText!(chat.chatId, lock.messageId as number, text)
+                            .then(() => true)
+                            .catch(() => false);
+                        if (edited) {
+                            return reply(`📡 live roster refreshed (owner pid ${lock.pid}) — the fleet message above is current.`);
+                        }
+                        // Edit failed (message gone?) → fall through to a fresh push.
+                    }
+                    return void (await sendLong(rosterText));
                 }
                 case "new": {
                     if (!cmd.text) {
